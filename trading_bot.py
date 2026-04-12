@@ -3,11 +3,15 @@ from datetime import datetime
 from mt5_connector import MT5Connector
 from strategy import TrendFollowingStrategy
 from risk_manager import RiskManager
+from position_monitor import PositionMonitor
 from kill_switch import KillSwitch
 from execution_tracker import ExecutionTracker
 from health_monitor import HealthMonitor
 from news_monitor import NewsMonitor
+from news_filter import NewsFilter
 from volatility_manager import VolatilityManager
+from telegram_notifier import TelegramNotifier
+from trade_database import TradeDatabase
 from config import Config
 from logger import logger
 
@@ -16,162 +20,165 @@ class TradingBot:
         self.connector = MT5Connector()
         self.strategy = TrendFollowingStrategy()
         self.risk_manager = RiskManager()
+        self.position_monitor = PositionMonitor(self.connector)
         self.kill_switch = KillSwitch()
         self.execution_tracker = ExecutionTracker()
         self.health_monitor = HealthMonitor()
         self.news_monitor = NewsMonitor()
+        self.news_filter = NewsFilter()
         self.volatility_manager = VolatilityManager()
+        self.notifier = TelegramNotifier()
+        self.db = TradeDatabase()
         self.running = False
-    
+
     def start(self):
         if not self.connector.connect():
             logger.error("Failed to connect to MT5")
             return False
-        
+
         account_info = self.connector.get_account_info()
         if account_info:
             self.risk_manager.reset_daily_tracking(account_info['balance'])
             logger.info(f"Bot started - Balance: ${account_info['balance']:.2f}")
-        
+
         self.running = True
         self.health_monitor.heartbeat()
         return True
-    
+
     def stop(self):
         self.running = False
         self.connector.disconnect()
         logger.info("Bot stopped")
-    
+
     def execute_trading_cycle(self):
-        # Check kill switch
+        # Safety checks first
         if self.kill_switch.is_active():
             self.stop()
             return
-        
+
         if self.kill_switch.is_paused():
             return
-        
+
         if not self.running:
             return
-        
-        # Update heartbeat
+
         self.health_monitor.heartbeat()
-        
-        # Check health
+
         if not self.health_monitor.check_health():
-            logger.error("Health check failed - attempting recovery")
             if not self.health_monitor.auto_recover():
                 self.kill_switch.activate("Health check failed")
                 return
-        
+
         try:
-            # Check news
-            if not self.news_monitor.is_safe_to_trade():
-                logger.warning("High-impact news detected - skipping cycle")
+            # News checks
+            if not self.news_filter.is_safe_to_trade():
                 return
-            
-            # Get account info
+
+            if not self.news_monitor.is_safe_to_trade():
+                return
+
+            # Account info
             account_info = self.connector.get_account_info()
             if not account_info:
-                logger.error("Failed to get account info")
                 self.health_monitor.record_error("Account info failed")
                 return
-            
+
             # Update risk tracking
             self.risk_manager.reset_daily_tracking(account_info['balance'])
             self.risk_manager.update_daily_loss(account_info['balance'])
-            
+
+            # Update trailing stops on open positions
+            self.position_monitor.update_trailing_stops()
+
             # Get open positions
             positions = self.connector.get_positions(Config.SYMBOL)
             open_count = len(positions)
-            
+
             logger.info(f"Balance: ${account_info['balance']:.2f} | Open: {open_count} | Daily Loss: {self.risk_manager.daily_loss*100:.2f}%")
-            
-            # Check if we can trade
+
+            # Check trading conditions
             if not self.risk_manager.can_trade(open_count):
                 return
-            
+
             # Get market data
             df = self.connector.get_bars(Config.SYMBOL, Config.TIMEFRAME, 100)
             if df is None or len(df) == 0:
-                logger.error("Failed to get market data")
                 self.health_monitor.record_error("Market data failed")
                 return
-            
-            # Get higher timeframe
+
+            # Higher timeframe confirmation
             df_h1 = None
             if Config.USE_MTF_CONFIRMATION:
                 df_h1 = self.connector.get_bars(Config.SYMBOL, Config.HIGHER_TIMEFRAME, 50)
-            
+
             # Generate signal
             signal = self.strategy.generate_signal(df, df_h1)
             if signal is None:
                 return
-            
-            # Validate risk:reward
+
+            # Validate R:R
             if not self.risk_manager.validate_risk_reward(signal['price'], signal['sl'], signal['tp']):
                 return
-            
-            # Get symbol info for accurate position sizing
+
+            # Get symbol info for accurate sizing
             symbol_info = self.connector.get_symbol_info(Config.SYMBOL)
-            
-            # Adjust risk for volatility
-            current_atr = signal['atr']
-            avg_atr = df['atr'].mean() if 'atr' in df else current_atr
-            adjusted_risk = self.volatility_manager.adjust_risk_for_volatility(current_atr, avg_atr)
-            
-            # Calculate position size with adjusted risk
+
+            # Adjust for volatility
+            avg_atr = df['atr'].mean() if 'atr' in df.columns else signal['atr']
+            adjusted_risk = self.volatility_manager.adjust_risk_for_volatility(signal['atr'], avg_atr)
+
+            # Calculate position size
             position_size = self.risk_manager.calculate_position_size(
                 account_info['balance'],
                 signal['price'],
                 signal['sl'],
                 symbol_info
             )
-            
-            # Adjust for volatility
-            position_size = position_size * (adjusted_risk / Config.RISK_PER_TRADE)
-            position_size = max(0.01, round(position_size, 2))
-            
+
+            # Apply volatility adjustment
+            position_size = max(0.01, round(position_size * (adjusted_risk / Config.RISK_PER_TRADE), 2))
+
             # Close opposite positions
             for pos in positions:
                 if (signal['type'] == 'BUY' and pos.type == mt5.ORDER_TYPE_SELL) or \
                    (signal['type'] == 'SELL' and pos.type == mt5.ORDER_TYPE_BUY):
                     self.connector.close_position(pos.ticket)
+                    self.position_monitor.untrack(pos.ticket)
                     logger.info(f"Closed opposite position: {pos.ticket}")
-            
+
             # Place order
             order_type = mt5.ORDER_TYPE_BUY if signal['type'] == 'BUY' else mt5.ORDER_TYPE_SELL
-            
-            # Get current price for slippage tracking
+
             tick = mt5.symbol_info_tick(Config.SYMBOL)
             intended_price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-            
+
             result = self.connector.place_order(
                 Config.SYMBOL,
                 order_type,
                 position_size,
                 sl=signal['sl'],
                 tp=signal['tp'],
-                comment=f"{self.strategy.name}"
+                comment=self.strategy.name
             )
-            
+
             if result:
-                # Track execution quality
                 executed_price = result.price
                 self.execution_tracker.track_execution(intended_price, executed_price, signal['type'])
-                
-                logger.info(f"Trade executed: {signal['type']} {position_size} lots @ {executed_price:.2f}")
-                
-                # Reset error count on success
+                self.position_monitor.track(result.order, signal['atr'])
+                self.risk_manager.track_trade(signal['type'], executed_price, position_size)
+                self.db.insert_trade(result.order, Config.SYMBOL, signal['type'],
+                                     executed_price, signal['sl'], signal['tp'], position_size)
+                self.notifier.notify_trade(signal['type'], Config.SYMBOL, executed_price,
+                                           signal['sl'], signal['tp'], position_size)
                 self.health_monitor.reset_errors()
+                logger.info(f"✅ Trade: {signal['type']} {position_size} lots @ {executed_price:.2f}")
             else:
-                logger.error("Failed to execute trade")
                 self.health_monitor.record_error("Order execution failed")
-        
+                self.notifier.notify_error("Order execution failed")
+
         except Exception as e:
-            logger.error(f"Error in trading cycle: {e}", exc_info=True)
+            logger.error(f"Cycle error: {e}", exc_info=True)
             self.health_monitor.record_error(str(e))
-    
+
     def run_once(self):
-        """Execute one trading cycle - useful for scheduled runs"""
         self.execute_trading_cycle()
