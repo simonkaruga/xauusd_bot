@@ -40,9 +40,12 @@ class Config:
     RSI_SELL_MIN = 35
     RSI_SELL_MAX = 55
 
-    # Trading Session (GMT)
-    TRADING_START_HOUR = 13      # 1 PM GMT = 4 PM Nairobi
-    TRADING_END_HOUR = 16        # 4 PM GMT = 7 PM Nairobi
+    # Trading Session (GMT) - London/NY Overlap ONLY (Best hours)
+    TRADING_START_HOUR = 12      # 12 PM GMT = 3 PM Nairobi = 2 PM SA
+    TRADING_END_HOUR = 16        # 4 PM GMT  = 7 PM Nairobi = 6 PM SA
+
+    # Best trading days (Mon-Thu only, avoid Friday)
+    TRADING_DAYS = 'mon-thu'     # Skip Friday (NFP risk, position squaring)
 
     # Logging
     LOG_LEVEL = 'INFO'
@@ -53,10 +56,12 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-    # News Filter
+    # News Filter - All high impact USD events
     NEWS_BLACKOUT_PERIODS = [
-        {'day': 'Friday', 'start': '12:30', 'end': '13:30', 'event': 'NFP'},
-        {'day': 'Wednesday', 'start': '18:00', 'end': '19:00', 'event': 'FOMC'},
+        {'day': 'Friday',    'start': '12:00', 'end': '14:00', 'event': 'NFP'},
+        {'day': 'Wednesday', 'start': '17:30', 'end': '19:30', 'event': 'FOMC'},
+        {'day': 'Tuesday',   'start': '12:00', 'end': '13:00', 'event': 'CPI'},
+        {'day': 'Thursday',  'start': '12:00', 'end': '13:00', 'event': 'GDP/Jobless'},
     ]
 
     # Multi-timeframe
