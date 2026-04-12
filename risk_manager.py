@@ -62,11 +62,11 @@ class RiskManager:
     def calculate_position_size(self, account_balance, entry_price, sl_price, symbol_info=None):
         """
         Correct XAU/USD position sizing:
-        Risk Amount = Balance * Risk %
-        Position Size = Risk Amount / (SL distance * Contract Size)
-        For XAU/USD: Contract Size = 100 oz
+        Uses SIMULATED_BALANCE on demo so results match real $1,000 account
         """
-        risk_amount = account_balance * Config.RISK_PER_TRADE
+        # Use simulated balance on demo to get realistic position sizes
+        effective_balance = Config.SIMULATED_BALANCE if hasattr(Config, 'SIMULATED_BALANCE') else account_balance
+        risk_amount = effective_balance * Config.RISK_PER_TRADE
         price_diff = abs(entry_price - sl_price)
 
         if price_diff == 0:
