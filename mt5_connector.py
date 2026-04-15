@@ -31,6 +31,9 @@ class MT5Connector:
         logger.error("All MT5 connection attempts failed")
         return False
 
+    def is_connected(self) -> bool:
+        return self.connected and mt5.account_info() is not None
+
     def ensure_connection(self):
         if not self.connected or mt5.account_info() is None:
             logger.warning("Connection lost - reconnecting...")
@@ -163,6 +166,81 @@ class MT5Connector:
 
         logger.error("Order failed with all filling modes")
         return None
+
+    def place_limit_order(self, symbol, order_type, volume, limit_price,
+                          sl=0.0, tp=0.0, comment="", expiry_seconds=900):
+        """
+        Place a pending limit order.
+        order_type: mt5.ORDER_TYPE_BUY_LIMIT or mt5.ORDER_TYPE_SELL_LIMIT
+        expiry_seconds: seconds until auto-cancel (default 900 = 1 M15 bar)
+        Returns the order ticket on success, None on failure.
+        """
+        if not self.ensure_connection():
+            return None
+
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            logger.error(f"Symbol {symbol} not found")
+            return None
+
+        if not symbol_info.visible:
+            mt5.symbol_select(symbol, True)
+
+        from datetime import datetime, timedelta
+        expiry_dt = datetime.now() + timedelta(seconds=expiry_seconds)
+
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "price": round(limit_price, symbol_info.digits),
+            "sl": sl,
+            "tp": tp,
+            "expiration": expiry_dt,
+            "type_time": mt5.ORDER_TIME_SPECIFIED,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+            "magic": 234000,
+            "comment": comment,
+        }
+
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(
+                f"Limit order placed: ticket={result.order} "
+                f"type={order_type} {volume}L @ {limit_price:.2f} "
+                f"expires in {expiry_seconds}s"
+            )
+            return result.order   # return ticket number
+        else:
+            code = result.retcode if result else 'N/A'
+            comment_str = result.comment if result else ''
+            logger.error(f"Limit order failed: {code} - {comment_str}")
+            return None
+
+    def cancel_order(self, ticket) -> bool:
+        """Cancel a pending limit order by ticket."""
+        if not self.ensure_connection():
+            return False
+
+        request = {
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": ticket,
+        }
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"Limit order cancelled: {ticket}")
+            return True
+        code = result.retcode if result else 'N/A'
+        logger.warning(f"Cancel order {ticket} failed: {code}")
+        return False
+
+    def get_pending_orders(self, symbol=None):
+        """Return list of pending (unfilled) orders."""
+        if not self.ensure_connection():
+            return []
+        orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+        return list(orders) if orders else []
 
     def close_position(self, ticket):
         if not self.ensure_connection():

@@ -3,6 +3,56 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+# ---------------------------------------------------------------------------
+# Strategy parameters that the walk-forward optimizer may override.
+# ---------------------------------------------------------------------------
+_OPTIMIZABLE = {
+    'FAST_EMA':            int,
+    'SLOW_EMA':            int,
+    'RSI_BUY_MIN':         int,
+    'RSI_BUY_MAX':         int,
+    'RSI_SELL_MIN':        int,
+    'RSI_SELL_MAX':        int,
+    'ATR_MULTIPLIER_SL':   float,
+    'ATR_MULTIPLIER_TP':   float,
+    'ATR_MULTIPLIER_TP1':  float,
+}
+
+
+def _load_optimized_params():
+    """
+    If .env.optimized exists (written by WalkForwardOptimizer.apply_best_params),
+    parse it and override the matching Config class attributes.
+    Called once at import time so every module picks up the persisted params.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env.optimized')
+    if not os.path.exists(path):
+        return
+
+    loaded = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            key, _, value = line.partition('=')
+            key = key.strip()
+            if key in _OPTIMIZABLE and value.strip():
+                try:
+                    setattr(Config, key, _OPTIMIZABLE[key](value.strip()))
+                    loaded[key] = value.strip()
+                except ValueError:
+                    pass  # skip malformed lines
+
+    if loaded:
+        # Lazy import to avoid circular dependency
+        import logging
+        logging.getLogger(__name__).info(
+            f"config: loaded {len(loaded)} optimized param(s) from .env.optimized: {loaded}"
+        )
+
+
 class Config:
     # MT5 Connection
     MT5_LOGIN = int(os.getenv('MT5_LOGIN', 0))
@@ -82,3 +132,39 @@ class Config:
     USE_DELTA_FILTER = True
     VOLUME_PROFILE_BINS = 20
     DELTA_THRESHOLD = 0.6
+
+    # Partial position scaling: close TP1_FRACTION at TP1, let rest run to TP2.
+    # TP1 = entry + ATR_MULTIPLIER_TP1 × ATR  (lock in 2R)
+    # TP2 = entry + ATR_MULTIPLIER_TP  × ATR  (original full target)
+    USE_PARTIAL_CLOSE = True
+    ATR_MULTIPLIER_TP1 = 2.0        # close TP1_FRACTION here
+    TP1_FRACTION = 0.5              # close 50% of position at TP1
+
+    # Time stop: close position if neither SL nor TP hit within N bars
+    USE_TIME_STOP = True
+    TIME_STOP_BARS = 8              # 8 × M15 = 2 hours of dead capital max
+
+    # Limit order entry: post a limit instead of hitting the market.
+    # Entry is placed ATR_LIMIT_OFFSET × ATR inside current price.
+    # If not filled within LIMIT_ORDER_EXPIRY_BARS M15 bars, the order is cancelled.
+    # Set USE_LIMIT_ORDERS=False to revert to market orders.
+    USE_LIMIT_ORDERS = True
+    ATR_LIMIT_OFFSET = 0.5          # 0.5 × ATR pullback for better fill price
+    LIMIT_ORDER_EXPIRY_BARS = 1     # cancel after 1 bar (15 min) if unfilled
+
+    # Session liquidity guard: skip first and last N minutes of each session.
+    # Spreads are widest and algo activity highest at session boundaries.
+    SESSION_GUARD_MINUTES = 15
+
+    # Max drawdown from account peak before circuit breaker fires (10%)
+    MAX_DRAWDOWN_FROM_PEAK = 0.10
+
+    # Max total open risk across all positions as % of balance
+    MAX_PORTFOLIO_HEAT = 0.03
+
+    # Hard ceiling on risk per trade (safety net above Kelly)
+    MAX_RISK_PER_TRADE = 0.02
+
+
+# Apply any walk-forward optimized overrides saved in .env.optimized
+_load_optimized_params()
