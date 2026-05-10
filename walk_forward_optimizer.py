@@ -37,21 +37,66 @@ class WalkForwardOptimizer:
         initial_balance = initial_balance or Config.SIMULATED_BALANCE
         logger.info(f"Walk-forward optimization | train={train_days}d | test={test_days}d")
 
+        _original = {
+            'FAST_EMA': Config.FAST_EMA, 'SLOW_EMA': Config.SLOW_EMA,
+            'RSI_BUY_MIN': Config.RSI_BUY_MIN, 'RSI_BUY_MAX': Config.RSI_BUY_MAX,
+            'ATR_MULTIPLIER_TP': Config.ATR_MULTIPLIER_TP,
+        }
         param_grid = {
-            'FAST_EMA': [7, 9, 12],
-            'SLOW_EMA': [18, 21, 26],
-            'RSI_BUY_MIN': [40, 45, 50],
-            'RSI_BUY_MAX': [60, 65, 70],
+            'FAST_EMA': [7, 9, 12], 'SLOW_EMA': [18, 21, 26],
+            'RSI_BUY_MIN': [40, 45, 50], 'RSI_BUY_MAX': [60, 65, 70],
             'ATR_MULTIPLIER_TP': [3.0, 4.0, 5.0],
         }
 
-        total_combos = 1
-        for v in param_grid.values():
-            total_combos *= len(v)
-        logger.info(f"Testing {total_combos} parameter combinations")
+        in_sample_results = self._run_grid_search(symbol, train_days, initial_balance, param_grid)
 
-        in_sample_results = []
+        if not in_sample_results:
+            logger.error("No valid results from optimization")
+            for k, v in _original.items():
+                setattr(Config, k, v)
+            return None
 
+        best_is = self._select_by_deflated_sharpe(in_sample_results)
+        logger.info(f"Best IS params (Deflated Sharpe): {best_is['params']}")
+        logger.info(f"  IS Sharpe={best_is['is_sharpe']:.3f} | PF={best_is['is_pf']:.2f} "
+                    f"| WR={best_is['is_wr']:.1f}% | DD={best_is['is_dd']:.1f}%")
+
+        oos_result = self._validate_oos(best_is['params'], symbol, test_days, initial_balance,
+                                          in_sample_results)
+        if oos_result.get('overfit'):
+            for k, v in _original.items():
+                setattr(Config, k, v)
+            return oos_result
+
+        sensitivity = self.sensitivity_analysis(best_is['params'], in_sample_results, param_grid)
+        cpcv = self.cpcv_validate(symbol, best_is['params'], total_days=total_days,
+                                   initial_balance=initial_balance)
+
+        self.best_params = best_is['params']
+        self.all_results = in_sample_results
+        for k, v in _original.items():
+            setattr(Config, k, v)
+
+        final = {
+            'params': best_is['params'],
+            'is_sharpe': round(best_is['is_sharpe'], 3),
+            'oos_sharpe': round(oos_result['oos_sharpe'], 3),
+            'is_profit_factor': best_is['is_pf'],
+            'oos_profit_factor': oos_result['oos_pf'],
+            'overfit': False,
+            'sensitivity': sensitivity,
+            'cpcv': cpcv,
+        }
+        logger.info("=" * 55)
+        logger.info(f"  OOS Sharpe: {final['oos_sharpe']:.3f} | OOS PF: {final['oos_profit_factor']:.2f}")
+        logger.info(f"  Sensitivity (robust): {sensitivity['is_robust']}")
+        logger.info("=" * 55)
+        return final
+
+    def _run_grid_search(self, symbol: str, train_days: int,
+                          initial_balance: float, param_grid: dict) -> list:
+        """Run all parameter combinations in-sample. Returns list of result dicts."""
+        results = []
         for fast in param_grid['FAST_EMA']:
             for slow in param_grid['SLOW_EMA']:
                 if fast >= slow:
@@ -61,21 +106,16 @@ class WalkForwardOptimizer:
                         if rsi_min >= rsi_max:
                             continue
                         for tp_mult in param_grid['ATR_MULTIPLIER_TP']:
-                            # Apply params
                             Config.FAST_EMA = fast
                             Config.SLOW_EMA = slow
                             Config.RSI_BUY_MIN = rsi_min
                             Config.RSI_BUY_MAX = rsi_max
                             Config.ATR_MULTIPLIER_TP = tp_mult
-
-                            result = self.backtester.run(
-                                symbol, days=train_days,
-                                initial_balance=initial_balance
-                            )
+                            result = self.backtester.run(symbol, days=train_days,
+                                                         initial_balance=initial_balance)
                             if not result or 'error' in result:
                                 continue
-
-                            in_sample_results.append({
+                            results.append({
                                 'params': {
                                     'FAST_EMA': fast, 'SLOW_EMA': slow,
                                     'RSI_BUY_MIN': rsi_min, 'RSI_BUY_MAX': rsi_max,
@@ -88,69 +128,29 @@ class WalkForwardOptimizer:
                                 'is_dd': result.get('max_drawdown_pct', 100),
                                 'is_trades': result.get('total_trades', 0),
                             })
+        return results
 
-        if not in_sample_results:
-            logger.error("No valid results from optimization")
-            return None
+    def _validate_oos(self, params: dict, symbol: str,
+                       test_days: int, initial_balance: float,
+                       in_sample_results: list = None) -> dict:
+        """Run OOS backtest and check for overfitting. Returns result dict."""
+        for k, v in params.items():
+            setattr(Config, k, v)
+        oos = self.backtester.run(symbol, days=test_days, initial_balance=initial_balance)
+        oos_sharpe = oos.get('sharpe_ratio', 0) if oos and 'error' not in oos else 0
+        oos_pf = oos.get('profit_factor', 0) if oos and 'error' not in oos else 0
 
-        # --- Deflated Sharpe to find best IS candidate ---
-        best_is = self._select_by_deflated_sharpe(in_sample_results)
-        logger.info(f"Best IS params (Deflated Sharpe): {best_is['params']}")
-        logger.info(f"  IS Sharpe={best_is['is_sharpe']:.3f} | PF={best_is['is_pf']:.2f} "
-                    f"| WR={best_is['is_wr']:.1f}% | DD={best_is['is_dd']:.1f}%")
-
-        # --- Out-of-sample validation ---
-        params = best_is['params']
-        Config.FAST_EMA = params['FAST_EMA']
-        Config.SLOW_EMA = params['SLOW_EMA']
-        Config.RSI_BUY_MIN = params['RSI_BUY_MIN']
-        Config.RSI_BUY_MAX = params['RSI_BUY_MAX']
-        Config.ATR_MULTIPLIER_TP = params['ATR_MULTIPLIER_TP']
-
-        oos_result = self.backtester.run(symbol, days=test_days, initial_balance=initial_balance)
-        oos_sharpe = oos_result.get('sharpe_ratio', 0) if oos_result and 'error' not in oos_result else 0
-        oos_pf = oos_result.get('profit_factor', 0) if oos_result and 'error' not in oos_result else 0
-
-        # Overfitting check
-        is_sharpe = best_is['is_sharpe']
-        overfit_flag = False
+        is_sharpe = next(
+            (r['is_sharpe'] for r in (in_sample_results or self.all_results)
+             if r.get('params') == params), 0
+        )
         if is_sharpe > 0.5 and oos_sharpe < is_sharpe * 0.5:
-            overfit_flag = True
             logger.warning(
-                f"OVERFITTING DETECTED: IS Sharpe={is_sharpe:.3f}, OOS Sharpe={oos_sharpe:.3f}. "
-                f"Using conservative defaults."
+                f"OVERFITTING DETECTED: IS Sharpe={is_sharpe:.3f}, OOS Sharpe={oos_sharpe:.3f}."
             )
             self._reset_defaults()
             return {'overfit': True, 'is_sharpe': is_sharpe, 'oos_sharpe': oos_sharpe}
-
-        # Parameter sensitivity
-        sensitivity = self.sensitivity_analysis(best_is['params'], in_sample_results, param_grid)
-
-        # CPCV: distribution of OOS Sharpes across C(6,2)=15 paths
-        cpcv = self.cpcv_validate(symbol, params, total_days=total_days,
-                                   initial_balance=initial_balance)
-
-        self.best_params = params
-        self.all_results = in_sample_results
-
-        final = {
-            'params': params,
-            'is_sharpe': round(is_sharpe, 3),
-            'oos_sharpe': round(oos_sharpe, 3),
-            'is_profit_factor': best_is['is_pf'],
-            'oos_profit_factor': oos_pf,
-            'overfit': overfit_flag,
-            'sensitivity': sensitivity,
-            'cpcv': cpcv,
-        }
-
-        logger.info("=" * 55)
-        logger.info(f"  OOS Sharpe: {oos_sharpe:.3f} | OOS PF: {oos_pf:.2f}")
-        logger.info(f"  Overfit: {overfit_flag}")
-        logger.info(f"  Sensitivity (robust): {sensitivity['is_robust']}")
-        logger.info("=" * 55)
-
-        return final
+        return {'overfit': False, 'oos_sharpe': oos_sharpe, 'oos_pf': oos_pf}
 
     # ------------------------------------------------------------------
     # Combinatorial Purged Cross-Validation (CPCV)

@@ -1,6 +1,10 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class KillSwitch:
     def __init__(self):
@@ -24,7 +28,7 @@ class KillSwitch:
     def activate(self, reason="Manual activation"):
         """Activate kill switch"""
         with open(self.kill_file, 'w') as f:
-            f.write(f"Activated: {datetime.now()}\nReason: {reason}\n")
+            f.write(f"Activated: {_utcnow()}\nReason: {reason}\n")
         logger.critical(f"🚨 Kill switch activated: {reason}")
     
     def deactivate(self):
@@ -36,7 +40,7 @@ class KillSwitch:
     def pause(self):
         """Pause trading temporarily"""
         with open(self.pause_file, 'w') as f:
-            f.write(f"Paused: {datetime.now()}\n")
+            f.write(f"Paused: {_utcnow()}\n")
         logger.warning("⏸️ Trading paused")
     
     def resume(self):

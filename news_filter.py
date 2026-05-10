@@ -1,13 +1,17 @@
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from config import Config
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class NewsFilter:
     def __init__(self):
         self.blackout_periods = Config.NEWS_BLACKOUT_PERIODS
     
     def is_safe_to_trade(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         current_time = now.time()
         current_day = now.strftime('%A')
         

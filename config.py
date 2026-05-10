@@ -7,13 +7,13 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Strategy parameters that the walk-forward optimizer may override.
 # ---------------------------------------------------------------------------
+# Parameters the walk-forward optimizer may override.
+# Only include params that advanced_strategy.py actually reads —
+# RSI_BUY_MIN/MAX and RSI_SELL_MIN/MAX were removed because the active
+# strategy uses hardcoded RSI ranges in _pullback_confirmed(), not Config values.
 _OPTIMIZABLE = {
     'FAST_EMA':            int,
     'SLOW_EMA':            int,
-    'RSI_BUY_MIN':         int,
-    'RSI_BUY_MAX':         int,
-    'RSI_SELL_MIN':        int,
-    'RSI_SELL_MAX':        int,
     'ATR_MULTIPLIER_SL':   float,
     'ATR_MULTIPLIER_TP':   float,
     'ATR_MULTIPLIER_TP1':  float,
@@ -74,7 +74,7 @@ class Config:
     RISK_PER_TRADE = 0.01        # 1% of $1,000 = $10 per trade
     MAX_DAILY_LOSS = 0.03        # 3% of $1,000 = $30 max daily loss
     MAX_OPEN_TRADES = 1          # 1 trade at a time
-    MIN_RISK_REWARD = 2.0        # 1:2 R:R minimum
+    MIN_RISK_REWARD = 2.5        # 1:2.5 R:R minimum (raised from 2.0)
 
     # Strategy Parameters
     FAST_EMA = 9
@@ -82,7 +82,7 @@ class Config:
     RSI_PERIOD = 14
     ATR_PERIOD = 14
     ATR_MULTIPLIER_SL = 2.0
-    ATR_MULTIPLIER_TP = 4.0
+    ATR_MULTIPLIER_TP = 5.0      # 5R target on 2R stop = 2.5 R:R (matches MIN_RISK_REWARD)
 
     # RSI Filters
     RSI_BUY_MIN = 45
@@ -106,16 +106,22 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
+    # Signal broadcasting (optional — separate from personal alerts)
+    SIGNAL_CHANNEL_ID = os.getenv('SIGNAL_CHANNEL_ID', '')   # e.g. @MySignalChannel
+    SIGNAL_WEBHOOK_URL = os.getenv('SIGNAL_WEBHOOK_URL', '')  # copy-trading webhook
+
     # News Filter - All high impact USD events
     NEWS_BLACKOUT_PERIODS = [
         {'day': 'Friday',    'start': '12:00', 'end': '14:00', 'event': 'NFP'},
         {'day': 'Wednesday', 'start': '17:30', 'end': '19:30', 'event': 'FOMC'},
+        {'day': 'Wednesday', 'start': '12:00', 'end': '13:00', 'event': 'CPI'},
         {'day': 'Tuesday',   'start': '12:00', 'end': '13:00', 'event': 'CPI'},
         {'day': 'Thursday',  'start': '12:00', 'end': '13:00', 'event': 'GDP/Jobless'},
     ]
 
-    # Multi-timeframe
+    # Multi-timeframe — three-layer alignment: H4 + H1 + M15
     HIGHER_TIMEFRAME = 'H1'
+    H4_TIMEFRAME = 'H4'
     USE_MTF_CONFIRMATION = True
 
     # Trailing Stop
@@ -168,3 +174,23 @@ class Config:
 
 # Apply any walk-forward optimized overrides saved in .env.optimized
 _load_optimized_params()
+
+
+def validate_config():
+    """
+    Call once at startup. Raises ValueError with a clear message if any
+    required environment variable is missing or obviously wrong.
+    """
+    errors = []
+    if not Config.MT5_LOGIN:
+        errors.append("MT5_LOGIN is not set in .env")
+    if not Config.MT5_PASSWORD:
+        errors.append("MT5_PASSWORD is not set in .env")
+    if not Config.MT5_SERVER:
+        errors.append("MT5_SERVER is not set in .env")
+    if Config.RISK_PER_TRADE <= 0 or Config.RISK_PER_TRADE > 0.10:
+        errors.append(f"RISK_PER_TRADE={Config.RISK_PER_TRADE} is outside safe range (0, 0.10]")
+    if Config.MAX_DAILY_LOSS <= 0 or Config.MAX_DAILY_LOSS > 0.20:
+        errors.append(f"MAX_DAILY_LOSS={Config.MAX_DAILY_LOSS} is outside safe range (0, 0.20]")
+    if errors:
+        raise ValueError("Config validation failed:\n  " + "\n  ".join(errors))

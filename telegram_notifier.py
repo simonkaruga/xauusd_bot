@@ -51,3 +51,7 @@ class TelegramNotifier:
 
     def notify_error(self, error_msg):
         self.send(f"⚠️ <b>Bot Error</b>\n{error_msg}")
+
+    def send_message(self, message: str):
+        """Alias for send() — used by trading_bot for TP/SL hit alerts."""
+        self.send(message)

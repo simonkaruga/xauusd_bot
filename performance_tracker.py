@@ -1,7 +1,11 @@
 import csv
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class PerformanceTracker:
     def __init__(self):
@@ -26,7 +30,7 @@ class PerformanceTracker:
         with open(self.trades_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                datetime.now().isoformat(),
+                _utcnow().isoformat(),
                 trade_type, symbol, entry, exit_price, sl, tp, volume, profit, balance
             ])
     
@@ -34,6 +38,6 @@ class PerformanceTracker:
         with open(self.daily_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                datetime.now().date().isoformat(),
+                _utcnow().date().isoformat(),
                 trades, wins, losses, win_rate, profit, balance
             ])

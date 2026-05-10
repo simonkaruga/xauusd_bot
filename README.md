@@ -1,144 +1,145 @@
-# XAU/USD Automated Trading Bot
+# XAU/USD Institutional Trading Bot
 
-Fully automated trading bot for Gold/USD on MetaTrader 5 using trend-following strategy.
+Fully automated algorithmic trading bot for Gold/USD on MetaTrader 5.
+Uses a 4-layer institutional signal hierarchy: macro conviction → key level → pullback → EMA timing.
 
-## Features
+## Architecture
 
-- ✅ EMA Crossover (9/21) + RSI Filter Strategy
-- ✅ Automated Risk Management (2% per trade)
-- ✅ Daily Loss Circuit Breaker (6% max)
-- ✅ Dynamic Stop-Loss/Take-Profit (ATR-based)
-- ✅ Trading Session Control (London/NY Overlap)
-- ✅ Comprehensive Logging
+```
+Macro Gate (weekly/daily)
+  └── COT commercial positioning + 10Y real yield + DXY composite score
+  └── Only trades when macro score ≥ 0.40 — eliminates coin-flip neutral conditions
+
+Key Level Gate (H4/daily)
+  └── Entry must be at VWAP, volume profile HVN, or round-number level
+  └── Mid-air entries are penalised in confidence but not hard-blocked
+
+Pullback Confirmation (M15)
+  └── Reversal candle at the key level
+  └── RSI not overbought/oversold at entry
+  └── Volume ≥ 90% of 20-bar average
+
+EMA Timing (H4 + H1 + M15)
+  └── All three timeframes must agree on direction
+  └── Delta (buy vs sell pressure) confirmation
+```
 
 ## Quick Start
 
-### 1. Installation
+### 1. Install dependencies
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configuration
+### 2. Configure credentials
 
 ```bash
-# Copy environment template
 cp .env.example .env
-
-# Edit .env with your MT5 credentials
-nano .env
+nano .env   # fill in MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
 ```
 
-### 3. Run Bot
+### 3. Train the ML signal classifier (first run only)
 
 ```bash
-# Start automated trading
+python train_from_backtest.py
+```
+
+This requires MT5 to be connected. It downloads historical data, runs the backtester,
+and trains the GBM classifier that gates live signals. Output: `logs/signal_classifier.pkl`
+
+### 4. Start the bot
+
+```bash
 python main.py
 ```
 
-## Project Structure
+### Optional: Live dashboard
 
-```
-xauusd_bot/
-├── main.py              # Entry point with scheduler
-├── trading_bot.py       # Main bot orchestrator
-├── mt5_connector.py     # MT5 API wrapper
-├── strategy.py          # Trading strategy logic
-├── risk_manager.py      # Risk management system
-├── config.py            # Configuration settings
-├── logger.py            # Logging setup
-├── requirements.txt     # Dependencies
-├── .env                 # Credentials (create from .env.example)
-└── logs/                # Trading logs (auto-created)
+```bash
+# Open http://localhost:5000 in a browser
+# Dashboard auto-starts with the bot; or run standalone:
+python dashboard.py
 ```
 
-## Strategy Details
+## Module Map
 
-**Entry Signals:**
-- BUY: Fast EMA crosses above Slow EMA + RSI 40-70
-- SELL: Fast EMA crosses below Slow EMA + RSI 30-60
+| File | Role |
+|------|------|
+| `main.py` | Event-driven bar-close loop, background threads, optimizer trigger |
+| `trading_bot.py` | Main orchestrator — crash recovery, position restore |
+| `advanced_strategy.py` | 4-layer institutional strategy (this file is the signal engine) |
+| `risk_manager.py` | Kelly sizing, streak scaling, portfolio heat, circuit breaker |
+| `macro_engine.py` | Real yield (FRED) + DXY + COT composite score |
+| `news_sentiment.py` | Live NLP on RSS feeds — sentiment score fed to strategy |
+| `ml_signal_classifier.py` | GBM model, PSI drift detection, pass-through when no model |
+| `mt5_connector.py` | Full MT5 wrapper — limit orders, cancel, history |
+| `position_monitor.py` | Trailing stop, breakeven, partial close, time stop |
+| `trade_database.py` | SQLite with WAL mode, full trade attribution |
+| `walk_forward_optimizer.py` | CPCV, Deflated Sharpe, config snapshot |
+| `backtester.py` | M1 simulation, realistic costs, Monte Carlo |
+| `correlation_filter.py` | USD proxy macro filter (EURUSD/DXY alignment) |
+| `vwap_filter.py` | Daily VWAP + standard deviation bands |
+| `volume_profile.py` | POC, HVN/LVN, value area — used for TP targeting |
+| `cot_fetcher.py` | CFTC Commitment of Traders data, weekly cache |
+| `health_monitor.py` | Real MT5 connectivity checks |
+| `kill_switch.py` | File-based kill/pause (touch `KILL` to halt) |
+| `dashboard.py` | Live Flask dashboard at port 5000 |
+| `telegram_notifier.py` | Trade alerts via Telegram bot |
+| `signal_broadcaster.py` | WebSocket broadcast for external consumers |
 
-**Exit:**
-- Take-Profit: 2x ATR
-- Stop-Loss: 1.5x ATR
+## Risk Settings (config.py)
 
-**Risk Management:**
-- 2% risk per trade
-- Max 2 open positions
-- 6% daily loss limit (circuit breaker)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MAX_RISK_PER_TRADE` | 1% | Kelly-adjusted, based on `SIMULATED_BALANCE` |
+| `MAX_DAILY_LOSS` | 3% | Circuit breaker threshold |
+| `MAX_PORTFOLIO_HEAT` | 3% | Total open risk across all positions |
+| `MIN_RISK_REWARD` | 2.0 | Minimum R:R to accept a signal |
+| `SIMULATED_BALANCE` | $1,000 | Risk anchor (position sizing reference) |
 
 ## Trading Schedule
 
-- **Active Hours:** 12:00-16:00 GMT (Mon-Fri)
-- **Check Interval:** Every 5 minutes
-- **Symbol:** XAU/USD
+- Active hours configurable in `config.py` (`TRADING_START_HOUR` / `TRADING_END_HOUR`)
+- Default: London/NY overlap (optimised via walk-forward analysis)
+- Session guard: no entries in first/last 15 minutes of session
+- Monday open and Friday close avoided
 
-## Safety Features
+## Running Tests
 
-1. **Circuit Breaker:** Stops trading if daily loss hits 6%
-2. **Position Limits:** Maximum 2 concurrent trades
-3. **Risk:Reward Validation:** Minimum 1:1.5 R:R required
-4. **Session Control:** Only trades during optimal hours
+```bash
+pytest tests/ -v
+```
 
-## Monitoring
+The test suite covers RiskManager, TradeDatabase, CorrelationFilter, AdvancedStrategy, and Config validation (28 tests).
 
-- All trades visible in MT5 terminal
-- Detailed logs in `logs/trading_bot.log`
-- Real-time monitoring via MT5 mobile app
+## Kill Switch
 
-## Testing Workflow
+To halt trading immediately without restarting the process:
 
-1. **Demo Testing (2 weeks minimum)**
-   - Use HFM demo account
-   - Monitor performance daily
-   - Validate strategy effectiveness
+```bash
+touch KILL        # stops new signals
+touch PAUSE       # pauses without stopping (remove file to resume)
+rm KILL           # resumes
+```
 
-2. **Live Deployment**
-   - Start with 0.01 lot size
-   - Gradually increase confidence
-   - Consider VPS for 24/7 uptime
+## Platform Requirements
 
-## Configuration Options
+MetaTrader 5 runs on **Windows only**. Options:
 
-Edit `config.py` to customize:
-- Strategy parameters (EMA periods, RSI thresholds)
-- Risk settings (risk per trade, max loss)
-- Trading hours
-- Position sizing
+- Windows desktop/laptop with MT5 installed
+- Windows VPS (Vultr, AWS, etc.) — recommended for 24/7 operation
+- Wine on Linux (limited support, not recommended for production)
 
-## Troubleshooting
+## Safety
 
-**Connection Issues:**
-- Verify MT5 credentials in `.env`
-- Ensure MT5 terminal is running
-- Check server name (HFM-Demo or HFM-Real)
-
-**No Trades Executing:**
-- Confirm trading hours (GMT timezone)
-- Check if circuit breaker is active
-- Review logs for signal generation
-
-**Position Sizing:**
-- Default: 0.01 lots (micro)
-- Automatically calculated based on 2% risk
-- Adjust in risk_manager.py if needed
-
-## Important Notes
-
-⚠️ **Start with demo account**
-⚠️ **Never risk more than you can afford to lose**
-⚠️ **Past performance doesn't guarantee future results**
-
-## Support
-
-For issues or questions:
-1. Check logs in `logs/trading_bot.log`
-2. Review MT5 terminal for trade details
-3. Verify configuration in `.env` and `config.py`
+- Always start on a demo account
+- Run `train_from_backtest.py` and review backtest stats before going live
+- Monitor the dashboard for signal frequency — should be 0-3 trades/week at macro conviction threshold 0.40
+- Never risk more than you can afford to lose
 
 ---
 
-**Version:** 1.0  
-**Author:** Kelvin  
+**Version:** 2.0 — Institutional Multi-Layer Strategy  
+**Author:** Simon  
 **License:** Personal Use Only

@@ -37,83 +37,73 @@ class PositionMonitor:
     def update_trailing_stops(self):
         if not Config.ENABLE_TRAILING_STOP:
             return
+        for pos in self.connector.get_positions(Config.SYMBOL):
+            meta = self.tracked.get(pos.ticket)
+            if meta:
+                self._update_position(pos, meta)
 
-        positions = self.connector.get_positions(Config.SYMBOL)
+    def _update_position(self, pos, meta: dict):
+        meta['bars_open'] += 1
+        atr = meta['atr']
+        entry = pos.price_open
+        current = pos.price_current
+        sl = pos.sl
+        is_buy = (pos.type == mt5.ORDER_TYPE_BUY)
+        profit_pts = (current - entry) if is_buy else (entry - current)
 
-        for pos in positions:
-            ticket = pos.ticket
-            meta = self.tracked.get(ticket)
-            if not meta:
-                continue
+        if Config.USE_PARTIAL_CLOSE and not meta['partial_done']:
+            self._maybe_partial_close(pos, meta, atr, profit_pts, current)
 
-            meta['bars_open'] += 1
-            atr = meta['atr']
-            entry = pos.price_open
-            current = pos.price_current
-            sl = pos.sl
+        if Config.USE_TIME_STOP and self._should_time_stop(pos.ticket, meta, atr, profit_pts):
+            return
 
-            is_buy = (pos.type == mt5.ORDER_TYPE_BUY)
-            profit_pts = (current - entry) if is_buy else (entry - current)
+        self._update_sl(pos.ticket, is_buy, entry, current, sl, atr, profit_pts)
 
-            # --------------------------------------------------------
-            # 1. Partial close at TP1 (first time only)
-            # --------------------------------------------------------
-            if Config.USE_PARTIAL_CLOSE and not meta['partial_done']:
-                tp1_dist = atr * Config.ATR_MULTIPLIER_TP1
-                if profit_pts >= tp1_dist:
-                    close_vol = round(pos.volume * Config.TP1_FRACTION, 2)
-                    close_vol = max(close_vol,
-                                    self._get_vol_min(pos.symbol))
-                    if close_vol < pos.volume:
-                        ok = self._partial_close(pos, close_vol)
-                        if ok:
-                            meta['partial_done'] = True
-                            logger.info(
-                                f"TP1 partial close: ticket={ticket} "
-                                f"closed {close_vol}L of {pos.volume}L "
-                                f"@ {current:.2f} (+{profit_pts:.2f}pts)"
-                            )
+    def _maybe_partial_close(self, pos, meta: dict, atr: float,
+                              profit_pts: float, current: float):
+        if profit_pts >= atr * Config.ATR_MULTIPLIER_TP1:
+            close_vol = max(round(pos.volume * Config.TP1_FRACTION, 2),
+                            self._get_vol_min(pos.symbol))
+            if close_vol < pos.volume and self._partial_close(pos, close_vol):
+                meta['partial_done'] = True
+                logger.info(
+                    f"TP1 partial close: ticket={pos.ticket} "
+                    f"closed {close_vol}L of {pos.volume}L @ {current:.2f} (+{profit_pts:.2f}pts)"
+                )
 
-            # --------------------------------------------------------
-            # 2. Time stop — close if unresolved after N bars
-            # --------------------------------------------------------
-            if Config.USE_TIME_STOP:
-                max_bars = Config.TIME_STOP_BARS
-                if meta['bars_open'] >= max_bars and profit_pts < atr * 0.5:
-                    # Only time-stop if we haven't reached breakeven profit
-                    logger.info(
-                        f"TIME STOP: ticket={ticket} open {meta['bars_open']} bars "
-                        f"with only {profit_pts:.2f}pts profit — closing"
-                    )
-                    self.connector.close_position(ticket)
-                    self.untrack(ticket)
-                    continue
+    def _should_time_stop(self, ticket: int, meta: dict, atr: float, profit_pts: float) -> bool:
+        if meta['bars_open'] >= Config.TIME_STOP_BARS and profit_pts < atr * 0.5:
+            logger.info(
+                f"TIME STOP: ticket={ticket} open {meta['bars_open']} bars "
+                f"with only {profit_pts:.2f}pts profit — closing"
+            )
+            self.connector.close_position(ticket)
+            self.untrack(ticket)
+            return True
+        return False
 
-            # --------------------------------------------------------
-            # 3. Breakeven then trail
-            # --------------------------------------------------------
-            if is_buy:
-                if profit_pts >= atr * Config.BREAKEVEN_TRIGGER and sl < entry:
-                    new_sl = entry + atr * 0.1
-                    if self.connector.modify_position_sl(ticket, new_sl):
-                        logger.info(f"Breakeven set: {ticket} SL→{new_sl:.2f}")
-
-                elif profit_pts > atr * Config.BREAKEVEN_TRIGGER:
-                    new_sl = current - atr * Config.TRAILING_DISTANCE
-                    if new_sl > sl:
-                        if self.connector.modify_position_sl(ticket, new_sl):
-                            logger.info(f"Trail SL: {ticket}→{new_sl:.2f}")
-            else:
-                if profit_pts >= atr * Config.BREAKEVEN_TRIGGER and sl > entry:
-                    new_sl = entry - atr * 0.1
-                    if self.connector.modify_position_sl(ticket, new_sl):
-                        logger.info(f"Breakeven set: {ticket} SL→{new_sl:.2f}")
-
-                elif profit_pts > atr * Config.BREAKEVEN_TRIGGER:
-                    new_sl = current + atr * Config.TRAILING_DISTANCE
-                    if new_sl < sl:
-                        if self.connector.modify_position_sl(ticket, new_sl):
-                            logger.info(f"Trail SL: {ticket}→{new_sl:.2f}")
+    def _update_sl(self, ticket: int, is_buy: bool, entry: float,
+                    current: float, sl: float, atr: float, profit_pts: float):
+        be_trigger = atr * Config.BREAKEVEN_TRIGGER
+        trail_dist = atr * Config.TRAILING_DISTANCE
+        if is_buy:
+            if profit_pts >= be_trigger and sl < entry:
+                new_sl = entry + atr * 0.1
+                if self.connector.modify_position_sl(ticket, new_sl):
+                    logger.info(f"Breakeven set: {ticket} SL→{new_sl:.2f}")
+            elif profit_pts > be_trigger:
+                new_sl = current - trail_dist
+                if new_sl > sl and self.connector.modify_position_sl(ticket, new_sl):
+                    logger.info(f"Trail SL: {ticket}→{new_sl:.2f}")
+        else:
+            if profit_pts >= be_trigger and sl > entry:
+                new_sl = entry - atr * 0.1
+                if self.connector.modify_position_sl(ticket, new_sl):
+                    logger.info(f"Breakeven set: {ticket} SL→{new_sl:.2f}")
+            elif profit_pts > be_trigger:
+                new_sl = current + trail_dist
+                if new_sl < sl and self.connector.modify_position_sl(ticket, new_sl):
+                    logger.info(f"Trail SL: {ticket}→{new_sl:.2f}")
 
     # ------------------------------------------------------------------
     # Partial close helper

@@ -10,7 +10,11 @@ Includes:
 
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class TradeDatabase:
@@ -21,15 +25,14 @@ class TradeDatabase:
 
     def _conn(self):
         conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
-        # WAL mode: readers never block writers, writers never block readers.
-        # Critical when dashboard (reads) and bot (writes) run concurrently.
         conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=NORMAL')   # safe + fast
-        conn.execute('PRAGMA cache_size=-8000')     # 8 MB page cache
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA cache_size=-8000')
         return conn
 
     def _init_db(self):
-        with self._conn() as conn:
+        conn = self._conn()
+        try:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,10 +88,13 @@ class TradeDatabase:
             self._add_column_if_missing(conn, 'trades', 'net_profit', 'REAL')
             self._add_column_if_missing(conn, 'trades', 'close_time', 'TEXT')
             conn.commit()
+        finally:
+            conn.close()
 
     def _add_column_if_missing(self, conn, table, column, col_type):
+        # table and col_type are always internal constants, never user input
         try:
-            conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {col_type}')
+            conn.execute('ALTER TABLE {} ADD COLUMN {} {}'.format(table, column, col_type))
         except sqlite3.OperationalError:
             pass  # Column already exists
 
@@ -105,7 +111,7 @@ class TradeDatabase:
                    status, session, regime, confidence, macro_mult, ml_score, comment)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
             ''', (
-                datetime.now().isoformat(), ticket, symbol, trade_type,
+                _utcnow().isoformat(), ticket, symbol, trade_type,
                 entry, sl, tp, volume,
                 session, regime, confidence, macro_mult, ml_score, comment
             ))
@@ -120,7 +126,7 @@ class TradeDatabase:
                     net_profit=?, status='CLOSED', close_time=?
                 WHERE ticket=? AND status='OPEN'
             ''', (exit_price, profit, commission, spread_cost, net,
-                  datetime.now().isoformat(), ticket))
+                  _utcnow().isoformat(), ticket))
 
     def upsert_daily_stats(self, date_str, starting_balance, ending_balance,
                             total_trades, wins, losses, net_profit,
@@ -150,7 +156,7 @@ class TradeDatabase:
     # Read
     # ------------------------------------------------------------------
     def get_daily_trades(self, date=None):
-        d = date or datetime.now().date().isoformat()
+        d = date or _utcnow().date().isoformat()
         with self._conn() as conn:
             cur = conn.execute(
                 "SELECT * FROM trades WHERE DATE(timestamp)=? AND status='CLOSED'", (d,)

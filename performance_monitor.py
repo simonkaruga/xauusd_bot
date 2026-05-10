@@ -10,9 +10,13 @@ Live tracking of:
 """
 
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from trade_database import TradeDatabase
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class PerformanceMonitor:
@@ -107,7 +111,7 @@ class PerformanceMonitor:
 
         if alert:
             logger.warning(f"Performance alert: {alert}")
-            self.alerts.append({'time': datetime.now().isoformat(), 'msg': alert})
+            self.alerts.append({'time': _utcnow().isoformat(), 'msg': alert})
 
         return alert
 

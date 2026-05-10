@@ -47,108 +47,86 @@ class MAEMFEAnalyzer:
         df_bars = df_bars.sort_values('time').reset_index(drop=True)
 
         mae_list, mfe_list, efficiency_list = [], [], []
-        win_mae, loss_mae = [], []
-        win_mfe, loss_mfe = [], []
+        win_mae, loss_mae, win_mfe, loss_mfe = [], [], [], []
 
         for t in closed:
-            ts_entry = pd.Timestamp(t[1])    # entry timestamp
-            ts_close = pd.Timestamp(t[21]) if t[21] else None
-            trade_type = t[4]
-            entry_price = t[5]
-            exit_price = t[6]
-            profit = t[13] or t[10] or 0
-
-            # Find bars between entry and close
-            if ts_close:
-                mask = (df_bars['time'] >= ts_entry) & (df_bars['time'] <= ts_close)
-            else:
-                # Approximate: 20 bars after entry
-                entry_idx = df_bars.index[df_bars['time'] >= ts_entry]
-                if len(entry_idx) == 0:
-                    continue
-                start = entry_idx[0]
-                mask = df_bars.index.isin(range(start, min(start + 20, len(df_bars))))
-
-            path = df_bars[mask]
-            if path.empty:
+            row = self._excursions_for_trade(t, df_bars)
+            if row is None:
                 continue
-
-            if trade_type == 'BUY':
-                mae = float((entry_price - path['low'].min()) / entry_price * 100)
-                mfe = float((path['high'].max() - entry_price) / entry_price * 100)
-                captured = float((exit_price - entry_price) / entry_price * 100)
-            else:
-                mae = float((path['high'].max() - entry_price) / entry_price * 100)
-                mfe = float((entry_price - path['low'].min()) / entry_price * 100)
-                captured = float((entry_price - exit_price) / entry_price * 100)
-
+            mae, mfe, eff, is_win = row
             mae_list.append(mae)
             mfe_list.append(mfe)
-            eff = (captured / mfe * 100) if mfe > 0 else 0
             efficiency_list.append(eff)
-
-            if profit > 0:
-                win_mae.append(mae)
-                win_mfe.append(mfe)
-            else:
-                loss_mae.append(mae)
-                loss_mfe.append(mfe)
+            (win_mae if is_win else loss_mae).append(mae)
+            (win_mfe if is_win else loss_mfe).append(mfe)
 
         if not mae_list:
             return {}
 
-        # Current ATR-based distances (in price terms, approx)
-        avg_atr_pct = df_bars['close'].pct_change().std() * 100 * 14  # rough ATR%
+        result = self._build_result(
+            mae_list, mfe_list, efficiency_list,
+            win_mae, win_mfe, loss_mae, loss_mfe,
+        )
+        self._log_report(result)
+        return result
 
-        # How far winning trades went against us (should be much less than SL)
-        avg_win_mae = np.mean(win_mae) if win_mae else 0
-        # How far losing trades went in our favour before reversing
-        avg_loss_mfe = np.mean(loss_mfe) if loss_mfe else 0
+    def _excursions_for_trade(self, t, df_bars: pd.DataFrame):
+        """Return (mae, mfe, efficiency, is_win) for one trade row, or None."""
+        ts_entry = pd.Timestamp(t[1])
+        ts_close = pd.Timestamp(t[21]) if t[21] else None
+        trade_type, entry_price, exit_price = t[4], t[5], t[6]
+        profit = t[13] or t[10] or 0
 
-        # Current SL as % of price (approx from config)
-        current_sl_mult = Config.ATR_MULTIPLIER_SL
-        current_tp1_mult = getattr(Config, 'ATR_MULTIPLIER_TP1', 2.0)
+        path = self._price_path(df_bars, ts_entry, ts_close)
+        if path.empty:
+            return None
 
-        # Recommendation: SL should cover 95th percentile MAE of winning trades
-        # (i.e. don't get stopped out of winners)
-        if win_mae:
-            p95_win_mae = np.percentile(win_mae, 95)
-            recommended_sl_pct = p95_win_mae * 1.2   # 20% buffer
+        if trade_type == 'BUY':
+            mae = float((entry_price - path['low'].min()) / entry_price * 100)
+            mfe = float((path['high'].max() - entry_price) / entry_price * 100)
+            captured = float((exit_price - entry_price) / entry_price * 100)
         else:
-            recommended_sl_pct = None
+            mae = float((path['high'].max() - entry_price) / entry_price * 100)
+            mfe = float((entry_price - path['low'].min()) / entry_price * 100)
+            captured = float((entry_price - exit_price) / entry_price * 100)
 
-        # Recommendation: TP1 should be at typical MFE of losing trades
-        # (lock in profit before the trade reverses)
-        if loss_mfe:
-            p50_loss_mfe = np.percentile(loss_mfe, 50)
-            recommended_tp1_pct = p50_loss_mfe * 0.9   # just below median losing trade MFE
-        else:
-            recommended_tp1_pct = None
+        eff = (captured / mfe * 100) if mfe > 0 else 0
+        return mae, mfe, eff, profit > 0
 
-        result = {
+    def _price_path(self, df_bars: pd.DataFrame,
+                    ts_entry: pd.Timestamp, ts_close) -> pd.DataFrame:
+        """Slice df_bars between entry and close timestamps."""
+        if ts_close:
+            return df_bars[(df_bars['time'] >= ts_entry) & (df_bars['time'] <= ts_close)]
+        entry_idx = df_bars.index[df_bars['time'] >= ts_entry]
+        if len(entry_idx) == 0:
+            return pd.DataFrame()
+        start = entry_idx[0]
+        return df_bars.iloc[start:min(start + 20, len(df_bars))]
+
+    def _build_result(self, mae_list, mfe_list, efficiency_list,
+                       win_mae, win_mfe, loss_mae, loss_mfe) -> dict:
+        """Compute summary stats and recommendations from excursion lists."""
+        p95_win_mae = np.percentile(win_mae, 95) if win_mae else None
+        p50_loss_mfe = np.percentile(loss_mfe, 50) if loss_mfe else None
+        return {
             'trades_analysed': len(mae_list),
             'avg_mae_pct': round(float(np.mean(mae_list)), 4),
             'avg_mfe_pct': round(float(np.mean(mfe_list)), 4),
             'avg_efficiency_pct': round(float(np.mean(efficiency_list)), 1),
             'p95_mae_pct': round(float(np.percentile(mae_list, 95)), 4),
             'p50_mfe_pct': round(float(np.percentile(mfe_list, 50)), 4),
-
             'wins_analysed': len(win_mae),
             'avg_win_mae_pct': round(float(np.mean(win_mae)), 4) if win_mae else 0,
             'avg_win_mfe_pct': round(float(np.mean(win_mfe)), 4) if win_mfe else 0,
-
             'losses_analysed': len(loss_mae),
             'avg_loss_mae_pct': round(float(np.mean(loss_mae)), 4) if loss_mae else 0,
-            'avg_loss_mfe_pct': round(float(avg_loss_mfe), 4),
-
-            'current_sl_mult': current_sl_mult,
-            'current_tp1_mult': current_tp1_mult,
-            'recommended_sl_pct': round(recommended_sl_pct, 4) if recommended_sl_pct else None,
-            'recommended_tp1_pct': round(recommended_tp1_pct, 4) if recommended_tp1_pct else None,
+            'avg_loss_mfe_pct': round(float(np.mean(loss_mfe)), 4) if loss_mfe else 0,
+            'current_sl_mult': Config.ATR_MULTIPLIER_SL,
+            'current_tp1_mult': getattr(Config, 'ATR_MULTIPLIER_TP1', 2.0),
+            'recommended_sl_pct': round(p95_win_mae * 1.2, 4) if p95_win_mae else None,
+            'recommended_tp1_pct': round(p50_loss_mfe * 0.9, 4) if p50_loss_mfe else None,
         }
-
-        self._log_report(result)
-        return result
 
     # ------------------------------------------------------------------
     # Report

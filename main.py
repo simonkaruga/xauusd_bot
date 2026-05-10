@@ -12,14 +12,70 @@ Architecture:
   - Weekly Sunday auto-retrain of ML classifier
 """
 
+import os
 import time
 import threading
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+from pathlib import Path
 import MetaTrader5 as mt5
 
 from trading_bot import TradingBot
-from config import Config
+from config import Config, validate_config
 from logger import logger
+
+
+# -----------------------------------------------------------------------
+# Pre-flight check
+# -----------------------------------------------------------------------
+
+def _preflight_check() -> bool:
+    """
+    Validates all prerequisites before the bot starts.
+    Prints a diagnostic banner and returns False if critical items are missing.
+    """
+    Path('logs').mkdir(exist_ok=True)
+
+    model_path = Path('logs/signal_classifier.pkl')
+    env_path   = Path('.env')
+
+    checks = [
+        ('.env file present',     env_path.exists()),
+        ('MT5_LOGIN configured',  Config.MT5_LOGIN != 0),
+        ('MT5_PASSWORD set',      bool(Config.MT5_PASSWORD)),
+        ('MT5_SERVER set',        bool(Config.MT5_SERVER)),
+        ('ML model trained',      model_path.exists()),
+        ('logs/ directory ready', True),
+    ]
+
+    width = 52
+    print('\n' + '=' * width)
+    print('  XAU/USD BOT — PRE-FLIGHT CHECK')
+    print('=' * width)
+    all_critical_ok = True
+    for label, ok in checks:
+        icon = 'OK' if ok else 'XX'
+        print(f'  [{icon}] {label}')
+        if not ok and label.startswith('MT5'):
+            all_critical_ok = False
+
+    if not model_path.exists():
+        print()
+        print('  WARNING: ML model not trained.')
+        print('  Bot will run in pass-through mode (all signals score 0.6).')
+        print('  Fix: python train_from_backtest.py   (needs MT5 connected)')
+
+    if not env_path.exists():
+        print()
+        print('  ERROR: .env file missing.')
+        print('  Fix:  cp .env.example .env  then fill in credentials.')
+        all_critical_ok = False
+
+    print('=' * width + '\n')
+    return all_critical_ok
 
 
 # -----------------------------------------------------------------------
@@ -37,12 +93,12 @@ def _mt5_timeframe(tf_str: str) -> int:
 
 
 def _is_trading_day() -> bool:
-    day = datetime.utcnow().weekday()   # Mon=0 … Sun=6
+    day = _utcnow().weekday()   # Mon=0 … Sun=6
     return day <= 3                     # Mon–Thu
 
 
 def _is_trading_hour() -> bool:
-    hour = datetime.utcnow().hour
+    hour = _utcnow().hour
     return Config.TRADING_START_HOUR <= hour < Config.TRADING_END_HOUR
 
 
@@ -57,7 +113,7 @@ def _run_dashboard():
     """Run Flask dashboard in a background thread (non-blocking)."""
     try:
         from dashboard import app
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+        app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
     except Exception as e:
         logger.warning(f"Dashboard failed to start: {e}")
 
@@ -96,6 +152,37 @@ def _retrain_ml(bot: TradingBot, reason: str) -> bool:
         return False
 
 
+def _maybe_run_optimizer(bot: TradingBot, last_optimize_date: date) -> date:
+    """
+    Run walk-forward optimizer on the first Sunday of each month.
+    Runs in a background thread so it never blocks the trading loop.
+    """
+    today = date.today()
+    is_sunday = today.weekday() == 6
+    is_first_sunday = today.day <= 7
+    if is_sunday and is_first_sunday and today != last_optimize_date:
+        def _run():
+            logger.info("Monthly walk-forward optimization starting (background thread)...")
+            try:
+                from walk_forward_optimizer import WalkForwardOptimizer
+                opt = WalkForwardOptimizer()
+                result = opt.optimize(total_days=120, train_days=60, test_days=20)
+                if result and not result.get('overfit'):
+                    opt.apply_best_params()
+                    logger.info(
+                        f"Optimizer applied new params | "
+                        f"IS Sharpe={result['is_sharpe']} OOS Sharpe={result['oos_sharpe']} "
+                        f"Robust={result['sensitivity']['is_robust']}"
+                    )
+                else:
+                    logger.warning("Optimizer: overfit detected or no result — keeping current params")
+            except Exception as e:
+                logger.warning(f"Walk-forward optimizer error: {e}")
+        threading.Thread(target=_run, daemon=True).start()
+        return today
+    return last_optimize_date
+
+
 def _maybe_retrain_ml(bot: TradingBot, last_retrain_date: date) -> date:
     """
     Retrain on two triggers:
@@ -125,6 +212,16 @@ def _maybe_retrain_ml(bot: TradingBot, last_retrain_date: date) -> date:
 # -----------------------------------------------------------------------
 
 def main():
+    if not _preflight_check():
+        print("STARTUP ABORTED: fix the issues above and restart.")
+        return
+
+    try:
+        validate_config()
+    except ValueError as e:
+        print(f"STARTUP ERROR: {e}")
+        return
+
     bot = TradingBot()
 
     if not bot.start():
@@ -139,6 +236,7 @@ def main():
     tf = _mt5_timeframe(Config.TIMEFRAME)
     last_bar_time: int | None = None
     last_retrain_date = date.min
+    last_optimize_date = date.min
     poll_interval = 10  # seconds between bar-time checks
 
     logger.info(
@@ -149,6 +247,9 @@ def main():
 
     try:
         while True:
+            # Monthly walk-forward optimization (first Sunday of month)
+            last_optimize_date = _maybe_run_optimizer(bot, last_optimize_date)
+
             # Weekly ML retrain check
             last_retrain_date = _maybe_retrain_ml(bot, last_retrain_date)
 
@@ -174,14 +275,14 @@ def main():
 
             if current_bar_time != last_bar_time:
                 # New bar just closed — fire immediately
-                elapsed = datetime.utcnow()
+                elapsed = _utcnow()
                 logger.info(
                     f"New {Config.TIMEFRAME} bar closed at "
                     f"{datetime.utcfromtimestamp(current_bar_time)} — running cycle"
                 )
                 last_bar_time = current_bar_time
                 bot.run_once()
-                latency_ms = (datetime.utcnow() - elapsed).total_seconds() * 1000
+                latency_ms = (_utcnow() - elapsed).total_seconds() * 1000
                 logger.info(f"Cycle completed in {latency_ms:.0f}ms")
 
             time.sleep(poll_interval)

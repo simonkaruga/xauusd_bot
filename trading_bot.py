@@ -11,7 +11,8 @@ Wires all modules together for a single trading cycle:
 """
 
 import MetaTrader5 as mt5
-from datetime import datetime
+import pandas_ta as ta
+from datetime import datetime, timedelta, timezone
 from mt5_connector import MT5Connector
 from advanced_strategy import AdvancedStrategy
 from risk_manager import RiskManager
@@ -29,6 +30,8 @@ from correlation_filter import CorrelationFilter
 from cot_fetcher import COTFetcher
 from dom_analysis import DOMAnalysis
 from vwap_filter import VWAPFilter
+from macro_engine import MacroEngine
+from news_sentiment import NewsSentiment
 from config import Config
 from logger import logger
 
@@ -67,6 +70,8 @@ class TradingBot:
         self.cot_fetcher = COTFetcher()
         self.dom = DOMAnalysis()
         self.vwap_filter = VWAPFilter()
+        self.macro_engine = MacroEngine(connector=self.connector)
+        self.news_sentiment = NewsSentiment()
         self.running = False
 
         # Pending limit order tracking: {ticket: {signal, expires_at, size}}
@@ -90,9 +95,52 @@ class TradingBot:
             )
 
         self.dom.enable(Config.SYMBOL)
+        self._restore_open_positions()
         self.running = True
         self.health_monitor.heartbeat()
         return True
+
+    def _restore_open_positions(self):
+        """
+        On startup, re-register any positions that were open before a crash.
+        Without this, position_monitor and risk_manager are blind to existing
+        trades and trailing stops / portfolio heat won't work correctly.
+        """
+        open_db = self.db.get_open_trades()
+        live_positions = {p.ticket: p for p in self.connector.get_positions(Config.SYMBOL)}
+
+        restored = 0
+        for row in open_db:
+            # row columns: id(0) ts(1) ticket(2) symbol(3) type(4) entry(5)
+            # exit(6) sl(7) tp(8) vol(9) profit(10) ... status(14) ... atr(?) ml(19)
+            ticket = row[2]
+            if ticket not in live_positions:
+                # Position closed while bot was offline — reconcile now
+                deals = self.connector.get_history_deals(days=7)
+                for deal in deals:
+                    if getattr(deal, 'position_id', None) == ticket:
+                        profit = getattr(deal, 'profit', 0)
+                        price = getattr(deal, 'price', 0)
+                        commission = abs(getattr(deal, 'commission', 0))
+                        swap = getattr(deal, 'swap', 0)
+                        self.db.close_trade(ticket, price, profit + swap, commission=commission)
+                        logger.info(f"Restored closed trade: ticket={ticket} P&L=${profit + swap:.2f}")
+                        break
+                continue
+
+            pos = live_positions[ticket]
+            entry = row[5]
+            sl = row[7]
+            volume = row[9]
+            # Use a default ATR of 2.0 if not stored; trailing stop will recalculate
+            atr = 2.0
+            self.position_monitor.track(ticket, atr)
+            self.risk_manager.register_open_trade(ticket, entry, sl, volume)
+            restored += 1
+            logger.info(f"Restored open position: ticket={ticket} entry={entry} vol={volume}")
+
+        if restored:
+            logger.info(f"Startup restore: {restored} open position(s) re-registered")
 
     def stop(self):
         self.running = False
@@ -103,215 +151,204 @@ class TradingBot:
     # Main cycle (called every 5 min by scheduler)
     # ------------------------------------------------------------------
     def execute_trading_cycle(self):
-        # --- Safety gates ---
-        if self.kill_switch.is_active():
-            self.stop()
+        if not self._pre_cycle_checks():
             return
-        if self.kill_switch.is_paused():
-            return
-        if not self.running:
-            return
-
-        self.health_monitor.heartbeat()
-        if not self.health_monitor.check_health():
-            if not self.health_monitor.auto_recover():
-                self.kill_switch.activate("Health check failed")
-                return
-
         try:
-            # Weekly COT refresh (Friday after 21:00 UTC = after CFTC release)
             self._maybe_refresh_cot()
-
-            # Check if any pending limit orders were filled or expired
             self._manage_pending_limits()
 
-            # News blackout
-            if not self.news_filter.is_safe_to_trade():
-                return
-            if not self.news_monitor.is_safe_to_trade():
+            if not self.news_filter.is_safe_to_trade() or not self.news_monitor.is_safe_to_trade():
                 return
 
-            # Account state
-            account_info = self.connector.get_account_info()
-            if not account_info:
-                self.health_monitor.record_error("Account info failed")
+            balance, positions = self._update_account_state()
+            if balance is None:
                 return
 
-            balance = account_info['balance']
-            self.risk_manager.reset_daily_tracking(balance)
-            self.risk_manager.update_daily_loss(balance)
-
-            # Update trailing stops on open positions
-            self.position_monitor.update_trailing_stops()
-
-            # Reconcile closed positions: update DB and deregister risk
-            self._reconcile_closed_positions()
-
-            positions = self.connector.get_positions(Config.SYMBOL)
-            open_count = len(positions)
-
-            logger.info(
-                f"Balance: ${balance:.2f} | Equity: ${account_info['equity']:.2f} | "
-                f"Open: {open_count} | Daily Loss: {self.risk_manager.daily_loss*100:.2f}% | "
-                f"Portfolio Heat: {self.risk_manager.get_portfolio_heat_pct(balance):.1f}%"
-            )
-
-            if not self.risk_manager.can_trade(open_count, balance):
+            if not self.risk_manager.can_trade(len(positions), balance):
                 return
 
-            # Market data
-            df = self.connector.get_bars(Config.SYMBOL, Config.TIMEFRAME, 200)
-            if df is None or len(df) < 55:
-                self.health_monitor.record_error("Market data failed")
-                return
-
-            df_h1 = None
-            if Config.USE_MTF_CONFIRMATION:
-                df_h1 = self.connector.get_bars(Config.SYMBOL, Config.HIGHER_TIMEFRAME, 100)
-
-            # Signal generation (regime-adaptive)
-            signal = self.strategy.generate_signal(df, df_h1)
+            signal, ml_score, macro_mult, macro_reason = self._evaluate_signal(balance)
             if signal is None:
                 return
 
-            # ML signal quality gate
-            ml_score = self.ml_classifier.predict(df, signal['type'])
-            if not self.ml_classifier.should_trade(df, signal['type']):
-                logger.info(f"ML gate BLOCKED signal (score={ml_score:.3f})")
-                return
-
-            # Macro / correlation filter
-            macro_ok, macro_mult, macro_reason = self.correlation_filter.check(
-                signal['type'], df
-            )
-            if not macro_ok:
-                return
-
-            # DOM / Level 2 gate
-            dom_ok, dom_mult = self.dom.check_signal(signal['type'], Config.SYMBOL)
-            if not dom_ok:
-                logger.info(f"DOM gate BLOCKED {signal['type']}")
-                return
-            # Fold DOM multiplier into macro multiplier
-            macro_mult *= dom_mult
-
-            # VWAP bias filter — adjusts size, never hard-blocks
-            _, vwap_mult = self.vwap_filter.check_signal(signal['type'], df)
-            macro_mult *= vwap_mult
-
-            # Round-number proximity guard
-            # XAU/USD has dense stop clusters near $50/$100 round numbers.
-            # Entries within ROUND_NUMBER_BUFFER pts of those levels are skipped:
-            # the spread + stop hunt risk outweighs the signal quality.
-            if self._near_round_number(signal['price']):
-                logger.info(
-                    f"ROUND NUMBER GUARD: skipping {signal['type']} near "
-                    f"round level (price={signal['price']:.2f})"
-                )
-                return
-
-            # Validate R:R
-            if not self.risk_manager.validate_risk_reward(signal['price'], signal['sl'], signal['tp']):
-                return
-
-            # Volatility adjustment
-            avg_atr = df['atr'].mean() if 'atr' in df.columns else signal['atr']
-            vol_adj = self.volatility_manager.adjust_risk_for_volatility(signal['atr'], avg_atr)
-
-            symbol_info = self.connector.get_symbol_info(Config.SYMBOL)
-
-            position_size = self.risk_manager.calculate_position_size(
-                balance,
-                signal['price'],
-                signal['sl'],
-                symbol_info=symbol_info,
-                signal_confidence=signal.get('confidence', 0.7),
-                macro_multiplier=macro_mult,
-                market_regime=signal.get('regime', 'trending'),
-            )
-
-            # Apply volatility adjustment on top
-            position_size = max(0.01, round(position_size * (vol_adj / Config.RISK_PER_TRADE), 2))
-            if symbol_info:
-                vol_min = symbol_info.get('volume_min', 0.01)
-                vol_step = symbol_info.get('volume_step', 0.01)
-                position_size = max(vol_min, round(round(position_size / vol_step) * vol_step, 2))
-
-            # Close opposite positions
-            for pos in positions:
-                if (signal['type'] == 'BUY' and pos.type == mt5.ORDER_TYPE_SELL) or \
-                   (signal['type'] == 'SELL' and pos.type == mt5.ORDER_TYPE_BUY):
-                    close_ok = self.connector.close_position(pos.ticket)
-                    if close_ok:
-                        self.position_monitor.untrack(pos.ticket)
-                        self.risk_manager.deregister_trade(pos.ticket)
-                        logger.info(f"Closed opposite position: {pos.ticket}")
-
-            # --- Order placement: limit or market ---
-            tick = mt5.symbol_info_tick(Config.SYMBOL)
-            if tick is None:
-                self.health_monitor.record_error("No tick data")
-                return
-
-            use_limit = getattr(Config, 'USE_LIMIT_ORDERS', True)
-            atr = signal.get('atr', 0)
-            offset = atr * getattr(Config, 'ATR_LIMIT_OFFSET', 0.5)
-            expiry_bars = getattr(Config, 'LIMIT_ORDER_EXPIRY_BARS', 1)
-            expiry_seconds = expiry_bars * 15 * 60   # M15 bars → seconds
-            session = _classify_session(datetime.utcnow().hour)
-            comment_str = f"{self.strategy.name}|{signal.get('regime','?')}"
-
-            if use_limit and offset > 0:
-                # Limit order: wait for price to pull back before entry
-                if signal['type'] == 'BUY':
-                    limit_price = tick.ask - offset      # buy cheaper on dip
-                    limit_type = mt5.ORDER_TYPE_BUY_LIMIT
-                    intended_price = tick.ask
-                else:
-                    limit_price = tick.bid + offset      # sell higher on rally
-                    limit_type = mt5.ORDER_TYPE_SELL_LIMIT
-                    intended_price = tick.bid
-
-                ticket = self.connector.place_limit_order(
-                    Config.SYMBOL, limit_type, position_size,
-                    limit_price=limit_price,
-                    sl=signal['sl'], tp=signal['tp'],
-                    comment=comment_str,
-                    expiry_seconds=expiry_seconds,
-                )
-
-                if ticket:
-                    from datetime import timedelta
-                    self._pending_limits[ticket] = {
-                        'signal': signal,
-                        'size': position_size,
-                        'session': session,
-                        'ml_score': ml_score,
-                        'macro_mult': macro_mult,
-                        'macro_reason': macro_reason,
-                        'intended_price': intended_price,
-                        'limit_price': limit_price,
-                        'expires_at': datetime.utcnow() + timedelta(seconds=expiry_seconds),
-                    }
-                    logger.info(
-                        f"LIMIT ORDER: {signal['type']} {position_size}L @ {limit_price:.2f} "
-                        f"(offset {offset:.2f} from {intended_price:.2f}) | "
-                        f"expires in {expiry_seconds}s | ticket={ticket}"
-                    )
-                    self.health_monitor.reset_errors()
-                else:
-                    # Limit order failed — fall back to market
-                    logger.warning("Limit order failed — falling back to market order")
-                    self._place_market_order(signal, position_size, tick, session,
-                                             ml_score, macro_mult, macro_reason)
-            else:
-                # Market order
-                self._place_market_order(signal, position_size, tick, session,
-                                         ml_score, macro_mult, macro_reason)
+            position_size = self._calculate_size(signal, balance, macro_mult)
+            self._close_opposite_positions(positions, signal['type'])
+            self._place_order(signal, position_size, ml_score, macro_mult, macro_reason)
 
         except Exception as e:
             logger.error(f"Cycle error: {e}", exc_info=True)
             self.health_monitor.record_error(str(e))
+
+    def _pre_cycle_checks(self) -> bool:
+        if self.kill_switch.is_active():
+            self.stop()
+            return False
+        if self.kill_switch.is_paused() or not self.running:
+            return False
+        self.health_monitor.heartbeat()
+        if not self.health_monitor.check_health():
+            if not self.health_monitor.auto_recover():
+                self.kill_switch.activate("Health check failed")
+            return False
+        return True
+
+    def _update_account_state(self):
+        """Refresh balance, trailing stops, reconcile. Returns (balance, positions) or (None, None)."""
+        account_info = self.connector.get_account_info()
+        if not account_info:
+            self.health_monitor.record_error("Account info failed")
+            return None, None
+
+        balance = account_info['balance']
+        self.risk_manager.reset_daily_tracking(balance)
+        self.risk_manager.update_daily_loss(balance)
+        self.position_monitor.update_trailing_stops()
+        self._reconcile_closed_positions()
+
+        positions = self.connector.get_positions(Config.SYMBOL)
+        logger.info(
+            f"Balance: ${balance:.2f} | Equity: ${account_info['equity']:.2f} | "
+            f"Open: {len(positions)} | Daily Loss: {self.risk_manager.daily_loss*100:.2f}% | "
+            f"Portfolio Heat: {self.risk_manager.get_portfolio_heat_pct(balance):.1f}%"
+        )
+        return balance, positions
+
+    def _evaluate_signal(self, balance: float):
+        """Fetch data, run all signal gates. Returns (signal, ml_score, macro_mult, macro_reason) or (None,…)."""
+        _none = (None, None, None, None)
+
+        df = self.connector.get_bars(Config.SYMBOL, Config.TIMEFRAME, 200)
+        if df is None or len(df) < 55:
+            self.health_monitor.record_error("Market data failed")
+            return _none
+
+        df_h1 = df_h4 = None
+        if Config.USE_MTF_CONFIRMATION:
+            df_h1 = self.connector.get_bars(Config.SYMBOL, Config.HIGHER_TIMEFRAME, 100)
+            df_h4 = self.connector.get_bars(Config.SYMBOL, Config.H4_TIMEFRAME, 60)
+
+        macro = self.macro_engine.get_macro_score()
+        sentiment = self.news_sentiment.get_sentiment_score()
+        self.strategy.set_macro_context(
+            macro_score=macro['score'], macro_direction=macro['direction'],
+            cot_score=macro['cot_score'], sentiment_score=sentiment['score'],
+        )
+
+        vwap_data = self.vwap_filter.compute(df)
+        vwap_price = vwap_data.get('vwap') if vwap_data else None
+        signal = self.strategy.generate_signal(df, df_h1, df_h4, vwap=vwap_price)
+        if signal is None:
+            return _none
+
+        ml_score = self.ml_classifier.predict(df, signal['type'])
+        if not self.ml_classifier.should_trade(df, signal['type']):
+            logger.info(f"ML gate BLOCKED signal (score={ml_score:.3f})")
+            return _none
+
+        macro_ok, macro_mult, macro_reason = self.correlation_filter.check(signal['type'], df)
+        if not macro_ok:
+            return _none
+
+        dom_ok, dom_mult = self.dom.check_signal(signal['type'], Config.SYMBOL)
+        if not dom_ok:
+            logger.info(f"DOM gate BLOCKED {signal['type']}")
+            return _none
+
+        _, vwap_mult = self.vwap_filter.check_signal(signal['type'], df)
+        macro_mult *= dom_mult * vwap_mult * self.news_sentiment.get_size_multiplier(signal['type'])
+
+        if self._near_round_number(signal['price']):
+            logger.info(f"ROUND NUMBER GUARD: skipping {signal['type']} @ {signal['price']:.2f}")
+            return _none
+
+        if not self.risk_manager.validate_risk_reward(signal['price'], signal['sl'], signal['tp']):
+            return _none
+
+        return signal, ml_score, macro_mult, macro_reason
+
+    def _calculate_size(self, signal: dict, balance: float, macro_mult: float) -> float:
+        """Compute volatility-adjusted position size."""
+        symbol_info = self.connector.get_symbol_info(Config.SYMBOL)
+        avg_atr = signal['atr']
+        try:
+            df = self.connector.get_bars(Config.SYMBOL, Config.TIMEFRAME, 200)
+            s = ta.atr(df['high'], df['low'], df['close'], length=Config.ATR_PERIOD)
+            if s is not None and not s.dropna().empty:
+                avg_atr = float(s.dropna().mean())
+        except Exception:
+            pass
+        vol_adj = self.volatility_manager.adjust_risk_for_volatility(signal['atr'], avg_atr)
+
+        size = self.risk_manager.calculate_position_size(
+            balance, signal['price'], signal['sl'],
+            symbol_info=symbol_info,
+            signal_confidence=signal.get('confidence', 0.7),
+            macro_multiplier=macro_mult,
+            market_regime=signal.get('regime', 'trending'),
+        )
+        size = max(0.01, round(size * (vol_adj / Config.RISK_PER_TRADE), 2))
+        if symbol_info:
+            vol_min = symbol_info.get('volume_min', 0.01)
+            vol_step = symbol_info.get('volume_step', 0.01)
+            size = max(vol_min, round(round(size / vol_step) * vol_step, 2))
+        return size
+
+    def _close_opposite_positions(self, positions, signal_type: str):
+        for pos in positions:
+            if (signal_type == 'BUY' and pos.type == mt5.ORDER_TYPE_SELL) or \
+               (signal_type == 'SELL' and pos.type == mt5.ORDER_TYPE_BUY):
+                if self.connector.close_position(pos.ticket):
+                    self.position_monitor.untrack(pos.ticket)
+                    self.risk_manager.deregister_trade(pos.ticket)
+                    logger.info(f"Closed opposite position: {pos.ticket}")
+
+    def _place_order(self, signal, position_size, ml_score, macro_mult, macro_reason):
+        tick = mt5.symbol_info_tick(Config.SYMBOL)
+        if tick is None:
+            self.health_monitor.record_error("No tick data")
+            return
+        session = _classify_session(datetime.now(timezone.utc).hour)
+        use_limit = getattr(Config, 'USE_LIMIT_ORDERS', True)
+        atr = signal.get('atr', 0)
+        offset = atr * getattr(Config, 'ATR_LIMIT_OFFSET', 0.5)
+        expiry_seconds = getattr(Config, 'LIMIT_ORDER_EXPIRY_BARS', 1) * 15 * 60
+
+        if use_limit and offset > 0:
+            self._try_limit_order(signal, position_size, tick, session,
+                                   ml_score, macro_mult, macro_reason, offset, expiry_seconds)
+        else:
+            self._place_market_order(signal, position_size, tick, session,
+                                     ml_score, macro_mult, macro_reason)
+
+    def _try_limit_order(self, signal, position_size, tick, session,
+                          ml_score, macro_mult, macro_reason, offset, expiry_seconds):
+        if signal['type'] == 'BUY':
+            limit_price, limit_type, intended_price = tick.ask - offset, mt5.ORDER_TYPE_BUY_LIMIT, tick.ask
+        else:
+            limit_price, limit_type, intended_price = tick.bid + offset, mt5.ORDER_TYPE_SELL_LIMIT, tick.bid
+
+        ticket = self.connector.place_limit_order(
+            Config.SYMBOL, limit_type, position_size,
+            limit_price=limit_price, sl=signal['sl'], tp=signal['tp'],
+            comment=f"{self.strategy.name}|{signal.get('regime','?')}",
+            expiry_seconds=expiry_seconds,
+        )
+        if ticket:
+            self._pending_limits[ticket] = {
+                'signal': signal, 'size': position_size, 'session': session,
+                'ml_score': ml_score, 'macro_mult': macro_mult, 'macro_reason': macro_reason,
+                'intended_price': intended_price, 'limit_price': limit_price,
+                'expires_at': datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=expiry_seconds),
+            }
+            logger.info(
+                f"LIMIT ORDER: {signal['type']} {position_size}L @ {limit_price:.2f} "
+                f"(offset {offset:.2f} from {intended_price:.2f}) | expires in {expiry_seconds}s | ticket={ticket}"
+            )
+            self.health_monitor.reset_errors()
+        else:
+            logger.warning("Limit order failed — falling back to market order")
+            self._place_market_order(signal, position_size, tick, session,
+                                     ml_score, macro_mult, macro_reason)
 
     # ------------------------------------------------------------------
     # Market order placement (shared by direct + limit-fallback paths)
@@ -366,7 +403,7 @@ class TradingBot:
         if not self._pending_limits:
             return
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         live_pending = {t.order for t in self.connector.get_pending_orders(Config.SYMBOL)}
         live_positions = {p.ticket for p in self.connector.get_positions(Config.SYMBOL)}
 
@@ -445,7 +482,7 @@ class TradingBot:
     # Weekly COT refresh
     # ------------------------------------------------------------------
     def _maybe_refresh_cot(self):
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         # Refresh every Friday after 21:00 UTC (CFTC releases ~20:30 UTC)
         is_friday = now.weekday() == 4
         past_release = now.hour >= 21
@@ -458,6 +495,7 @@ class TradingBot:
                 report = self.cot_fetcher.get_full_report()
                 cot_score = report.get('cot_score', 0.0)
                 self.ml_classifier.set_cot_score(cot_score)
+                self.macro_engine.set_cot_score(cot_score)
                 self._cot_last_refresh = now
                 logger.info(
                     f"COT weekly refresh: score={cot_score:+.3f} | "

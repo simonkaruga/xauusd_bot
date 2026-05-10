@@ -1,9 +1,13 @@
 import MetaTrader5 as mt5
 import pandas as pd
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from config import Config
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class MT5Connector:
     def __init__(self):
@@ -114,8 +118,8 @@ class MT5Connector:
         if not self.ensure_connection():
             return []
 
-        from_date = datetime.now() - timedelta(days=days)
-        deals = mt5.history_deals_get(from_date, datetime.now())
+        from_date = _utcnow() - timedelta(days=days)
+        deals = mt5.history_deals_get(from_date, _utcnow())
         return list(deals) if deals else []
 
     def place_order(self, symbol, order_type, volume, sl=0.0, tp=0.0, comment=""):
@@ -186,8 +190,7 @@ class MT5Connector:
         if not symbol_info.visible:
             mt5.symbol_select(symbol, True)
 
-        from datetime import datetime, timedelta
-        expiry_dt = datetime.now() + timedelta(seconds=expiry_seconds)
+        expiry_dt = _utcnow() + timedelta(seconds=expiry_seconds)
 
         request = {
             "action": mt5.TRADE_ACTION_PENDING,

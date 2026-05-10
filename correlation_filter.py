@@ -161,6 +161,7 @@ class CorrelationFilter:
     # Quick check for live trading (returns bool + log)
     # ------------------------------------------------------------------
     def check(self, signal_type: str, df_gold: pd.DataFrame) -> tuple:
+        """Returns (allowed: bool, multiplier: float, reason: str) — always 3 values."""
         df_usd = self.get_usd_proxy_data()
         allowed, multiplier, reason = self.is_macro_aligned(signal_type, df_gold, df_usd)
 
@@ -169,7 +170,7 @@ class CorrelationFilter:
         else:
             logger.info(f"Correlation Filter PASSED {signal_type}: {reason} (size x{multiplier:.2f})")
 
-        return allowed, multiplier
+        return allowed, multiplier, reason
 
 
 if __name__ == "__main__":

@@ -26,8 +26,12 @@ import json
 import zipfile
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 CACHE_PATH = 'logs/cot_cache.json'
 GOLD_MARKET_NAME = 'GOLD - COMMODITY EXCHANGE INC.'
@@ -90,7 +94,7 @@ class COTFetcher:
         if self._is_cache_fresh():
             return self._df_from_cache()
 
-        for year in [datetime.now().year, datetime.now().year - 1]:
+        for year in [_utcnow().year, _utcnow().year - 1]:
             df = self._download_year(year)
             if df is not None and not df.empty:
                 self._save_cache(df)
@@ -164,65 +168,14 @@ class COTFetcher:
             logger.warning(f"COT CSV parse error: {e}")
             return None
 
-        # Normalise column names
         df.columns = [c.strip().replace('"', '') for c in df.columns]
-
-        # Filter to gold
-        market_col = next(
-            (c for c in df.columns if 'market' in c.lower() and 'name' in c.lower()),
-            None
-        )
-        if market_col is None:
-            # Try commodity code
-            code_col = next((c for c in df.columns if 'code' in c.lower()), None)
-            if code_col:
-                df = df[df[code_col].astype(str).str.contains('088691', na=False)]
-            else:
-                logger.warning("COT: could not identify market column")
-                return None
-        else:
-            df = df[df[market_col].str.upper().str.contains('GOLD', na=False)]
-
-        if df.empty:
-            logger.warning("COT: no gold rows found in report")
+        df = self._filter_gold_rows(df)
+        if df is None or df.empty:
             return None
 
-        # Find date column — prefer the ISO format column when both exist
-        date_col = next(
-            (c for c in df.columns if 'yyyy' in c.lower() or 'yyyy-mm-dd' in c.lower()),
-            None
-        ) or next(
-            (c for c in df.columns
-             if any(k in c.lower() for k in ['report_date', 'as_of', 'date'])),
-            None
-        )
-
-        # Find long/short columns for Producer/Merchant (commercial)
-        long_col = next(
-            (c for c in df.columns
-             if 'prod' in c.lower() and 'long' in c.lower() and 'all' in c.lower()),
-            None
-        )
-        short_col = next(
-            (c for c in df.columns
-             if 'prod' in c.lower() and 'short' in c.lower() and 'all' in c.lower()),
-            None
-        )
-
+        date_col = self._find_date_col(df)
+        long_col, short_col = self._find_position_cols(df)
         if not long_col or not short_col:
-            # Fallback: look for commercial long/short
-            long_col = next(
-                (c for c in df.columns
-                 if 'comm' in c.lower() and 'long' in c.lower()), None
-            )
-            short_col = next(
-                (c for c in df.columns
-                 if 'comm' in c.lower() and 'short' in c.lower()), None
-            )
-
-        if not long_col or not short_col:
-            logger.warning(f"COT: cannot find commercial long/short columns. "
-                           f"Available: {list(df.columns[:20])}")
             return None
 
         result = pd.DataFrame()
@@ -235,9 +188,40 @@ class COTFetcher:
         )
         result = result.dropna(subset=['commercial_long', 'commercial_short'])
         result['commercial_net'] = result['commercial_long'] - result['commercial_short']
-        result = result.sort_values('date').reset_index(drop=True)
+        return result.sort_values('date').reset_index(drop=True)
 
-        return result
+    def _filter_gold_rows(self, df: pd.DataFrame) -> pd.DataFrame | None:
+        market_col = next(
+            (c for c in df.columns if 'market' in c.lower() and 'name' in c.lower()), None
+        )
+        if market_col:
+            return df[df[market_col].str.upper().str.contains('GOLD', na=False)]
+        code_col = next((c for c in df.columns if 'code' in c.lower()), None)
+        if code_col:
+            return df[df[code_col].astype(str).str.contains('088691', na=False)]
+        logger.warning("COT: could not identify market column")
+        return None
+
+    def _find_date_col(self, df: pd.DataFrame) -> str | None:
+        return next(
+            (c for c in df.columns if 'yyyy' in c.lower() or 'yyyy-mm-dd' in c.lower()), None
+        ) or next(
+            (c for c in df.columns if any(k in c.lower() for k in ['report_date', 'as_of', 'date'])), None
+        )
+
+    def _find_position_cols(self, df: pd.DataFrame) -> tuple[str | None, str | None]:
+        long_col = next(
+            (c for c in df.columns if 'prod' in c.lower() and 'long' in c.lower() and 'all' in c.lower()), None
+        )
+        short_col = next(
+            (c for c in df.columns if 'prod' in c.lower() and 'short' in c.lower() and 'all' in c.lower()), None
+        )
+        if not long_col or not short_col:
+            long_col = next((c for c in df.columns if 'comm' in c.lower() and 'long' in c.lower()), None)
+            short_col = next((c for c in df.columns if 'comm' in c.lower() and 'short' in c.lower()), None)
+        if not long_col or not short_col:
+            logger.warning(f"COT: cannot find commercial long/short columns. Available: {list(df.columns[:20])}")
+        return long_col, short_col
 
     # ------------------------------------------------------------------
     # Normalise to -1..+1 vs 52-week range
@@ -256,7 +240,7 @@ class COTFetcher:
         ts = self._cache.get('timestamp')
         if not ts:
             return False
-        age_hours = (datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 3600
+        age_hours = (_utcnow() - datetime.fromisoformat(ts)).total_seconds() / 3600
         return age_hours < CACHE_TTL_HOURS
 
     def _save_cache(self, df: pd.DataFrame):
@@ -268,7 +252,7 @@ class COTFetcher:
                 'commercial_short': float(row['commercial_short']),
                 'commercial_net': float(row['commercial_net']),
             })
-        self._cache = {'timestamp': datetime.now().isoformat(), 'rows': rows}
+        self._cache = {'timestamp': _utcnow().isoformat(), 'rows': rows}
         with open(CACHE_PATH, 'w') as f:
             json.dump(self._cache, f)
 
@@ -277,7 +261,7 @@ class COTFetcher:
             try:
                 with open(CACHE_PATH) as f:
                     return json.load(f)
-            except Exception:
+            except (OSError, json.JSONDecodeError):
                 pass
         return {}
 

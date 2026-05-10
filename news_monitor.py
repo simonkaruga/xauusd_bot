@@ -1,6 +1,10 @@
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class NewsMonitor:
     def __init__(self):
@@ -19,7 +23,7 @@ class NewsMonitor:
                     e for e in events 
                     if e.get('impact') == 'High' and 'USD' in e.get('country', '')
                 ]
-                self.last_fetch = datetime.now()
+                self.last_fetch = _utcnow()
                 logger.info(f"Fetched {len(self.high_impact_cache)} high-impact events")
                 return True
         except Exception as e:
@@ -30,19 +34,23 @@ class NewsMonitor:
         """Check if high-impact news is within 30 minutes"""
         if not self.high_impact_cache or not self.last_fetch:
             self.fetch_upcoming_events()
-        
+
         # Refresh every hour
-        if self.last_fetch and (datetime.now() - self.last_fetch).seconds > 3600:
+        if self.last_fetch and (_utcnow() - self.last_fetch).seconds > 3600:
             self.fetch_upcoming_events()
-        
-        now = datetime.now()
-        
+
+        now = _utcnow()
+
         for event in self.high_impact_cache:
-            event_time = datetime.fromisoformat(event['date'].replace('Z', '+00:00'))
-            time_diff = abs((event_time - now).total_seconds() / 60)
-            
-            if time_diff < 30:  # Within 30 minutes
-                logger.warning(f"High-impact news in {time_diff:.0f} min: {event['title']}")
-                return False
-        
+            try:
+                event_time = datetime.fromisoformat(
+                    event['date'].replace('Z', '+00:00')
+                ).replace(tzinfo=None)
+                time_diff = abs((event_time - now).total_seconds() / 60)
+                if time_diff < 30:
+                    logger.warning(f"High-impact news in {time_diff:.0f} min: {event['title']}")
+                    return False
+            except (ValueError, KeyError):
+                continue
+
         return True

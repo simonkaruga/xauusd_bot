@@ -1,67 +1,60 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class ExecutionTracker:
     def __init__(self):
         self.executions = []
-        self.slippage_threshold = 5.0  # 5 pips max acceptable
+        self.slippage_threshold = 0.50  # $0.50 max acceptable slippage (XAU/USD price points)
     
     def track_execution(self, intended_price, executed_price, order_type):
         """Track slippage on each execution"""
+        # Slippage in raw price points (XAU/USD quoted in USD per oz)
         slippage = abs(executed_price - intended_price)
-        slippage_pips = slippage * 10  # For XAU/USD
-        
+
         execution = {
-            'timestamp': datetime.now(),
+            'timestamp': _utcnow(),
             'intended': intended_price,
             'executed': executed_price,
             'slippage': slippage,
-            'slippage_pips': slippage_pips,
             'type': order_type
         }
-        
+
         self.executions.append(execution)
-        
-        if slippage_pips > self.slippage_threshold:
-            logger.warning(f"⚠️ High slippage: {slippage_pips:.1f} pips on {order_type}")
+
+        if slippage > self.slippage_threshold:
+            logger.warning(f"High slippage: {slippage:.2f} pts on {order_type}")
         else:
-            logger.info(f"✅ Execution OK: {slippage_pips:.1f} pips slippage")
-        
+            logger.info(f"Execution OK: {slippage:.2f} pts slippage")
+
         return execution
-    
+
     def get_avg_slippage(self, last_n=20):
-        """Calculate average slippage"""
+        """Calculate average slippage in price points"""
         if not self.executions:
             return 0
-        
         recent = self.executions[-last_n:]
-        avg_slippage = sum(e['slippage_pips'] for e in recent) / len(recent)
-        
-        return avg_slippage
-    
+        return sum(e['slippage'] for e in recent) / len(recent)
+
     def is_execution_quality_good(self):
-        """Check if broker execution is acceptable"""
         if len(self.executions) < 10:
             return True
-        
         avg_slippage = self.get_avg_slippage()
-        
         if avg_slippage > self.slippage_threshold:
-            logger.error(f"❌ Poor execution quality: {avg_slippage:.1f} pips avg slippage")
+            logger.error(f"Poor execution quality: {avg_slippage:.2f} pts avg slippage")
             return False
-        
         return True
-    
+
     def get_stats(self):
-        """Get execution statistics"""
         if not self.executions:
             return None
-        
-        slippages = [e['slippage_pips'] for e in self.executions]
-        
+        slippages = [e['slippage'] for e in self.executions]
         return {
             'total_executions': len(self.executions),
-            'avg_slippage': sum(slippages) / len(slippages),
-            'max_slippage': max(slippages),
-            'min_slippage': min(slippages)
+            'avg_slippage': round(sum(slippages) / len(slippages), 3),
+            'max_slippage': round(max(slippages), 3),
+            'min_slippage': round(min(slippages), 3),
         }

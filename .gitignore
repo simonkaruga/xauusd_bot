@@ -2,7 +2,12 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.optimized
 logs/
 *.log
 .DS_Store
 *.db
+*.pkl
+*.jsonl
+KILL_SWITCH.txt
+PAUSE_TRADING.txt

@@ -10,13 +10,20 @@ Institutional-grade risk controls:
   - Streak-adaptive risk scaling
 """
 
+import json
+import os
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from config import Config
 from logger import logger
 
 
-CONTRACT_SIZE = 100   # XAU/USD oz per lot
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+CONTRACT_SIZE = 100
+_STATE_PATH = 'logs/risk_state.json'
 
 
 class RiskManager:
@@ -24,28 +31,56 @@ class RiskManager:
         self.daily_start_balance = 0.0
         self.peak_balance = 0.0
         self.daily_loss = 0.0
-        self.current_date = date.today()
+        self.current_date = datetime.now(timezone.utc).date()
         self.circuit_breaker_active = False
-
         self.daily_trades = []
         self.daily_profit = 0.0
         self.trades_today = 0
-
-        # Streak tracking (updated after each closed trade)
         self.winning_streak = 0
         self.losing_streak = 0
-
-        # Running trade history for Kelly calculation
         self._trade_profits = []
-
-        # Portfolio heat: {ticket: risk_amount_dollars}
         self._open_risk = {}
+        self._load_state()
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+    def _save_state(self):
+        os.makedirs('logs', exist_ok=True)
+        state = {
+            'peak_balance': self.peak_balance,
+            'winning_streak': self.winning_streak,
+            'losing_streak': self.losing_streak,
+            'trade_profits': self._trade_profits[-200:],  # keep last 200
+            'saved_at': _utcnow().isoformat(),
+        }
+        with open(_STATE_PATH, 'w') as f:
+            json.dump(state, f)
+
+    def _load_state(self):
+        if not os.path.exists(_STATE_PATH):
+            return
+        try:
+            with open(_STATE_PATH) as f:
+                state = json.load(f)
+            self.peak_balance = state.get('peak_balance', 0.0)
+            self.winning_streak = state.get('winning_streak', 0)
+            self.losing_streak = state.get('losing_streak', 0)
+            self._trade_profits = state.get('trade_profits', [])
+            logger.info(
+                f"RiskManager state restored: peak=${self.peak_balance:.2f} "
+                f"streaks W{self.winning_streak}/L{self.losing_streak} "
+                f"history={len(self._trade_profits)} trades"
+            )
+        except Exception as e:
+            logger.warning(f"RiskManager: could not load state: {e}")
+
 
     # ------------------------------------------------------------------
     # Daily reset
     # ------------------------------------------------------------------
     def reset_daily_tracking(self, current_balance: float):
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         if today != self.current_date:
             self._log_daily_summary()
             self.current_date = today
@@ -62,6 +97,7 @@ class RiskManager:
 
         if current_balance > self.peak_balance:
             self.peak_balance = current_balance
+            self._save_state()
 
     def _log_daily_summary(self):
         if not self.daily_trades:
@@ -272,6 +308,7 @@ class RiskManager:
             else:
                 self.losing_streak += 1
                 self.winning_streak = 0
+            self._save_state()
             logger.info(f"Trade closed: ${profit:.2f} | Streaks W{self.winning_streak}/L{self.losing_streak}")
 
     # ------------------------------------------------------------------
@@ -280,7 +317,7 @@ class RiskManager:
     def track_trade(self, trade_type: str, entry_price: float, volume: float, profit: float = None):
         self.trades_today += 1
         trade = {
-            'time': datetime.now(),
+            'time': _utcnow(),
             'type': trade_type,
             'entry': entry_price,
             'volume': volume,

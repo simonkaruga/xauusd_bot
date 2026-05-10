@@ -45,12 +45,20 @@ class VolumeProfile:
         lvn_indices = np.argsort(volume_at_price)[:3]
         lvn_prices = [price_min + (i * bin_size) for i in lvn_indices]
         
+        # Value area: weighted percentile using cumulative volume
+        cumvol = np.cumsum(volume_at_price)
+        total_vol = cumvol[-1]
+        va_high_idx = np.searchsorted(cumvol, total_vol * 0.70)
+        va_low_idx  = np.searchsorted(cumvol, total_vol * 0.30)
+        va_high_idx = min(va_high_idx, self.bins - 1)
+        va_low_idx  = min(va_low_idx,  self.bins - 1)
+
         return {
             'poc': poc_price,
             'hvn': sorted(hvn_prices),
             'lvn': sorted(lvn_prices),
-            'value_area_high': price_min + (np.percentile(range(self.bins), 70, weights=volume_at_price) * bin_size),
-            'value_area_low': price_min + (np.percentile(range(self.bins), 30, weights=volume_at_price) * bin_size)
+            'value_area_high': price_min + (va_high_idx * bin_size),
+            'value_area_low':  price_min + (va_low_idx  * bin_size),
         }
     
     def get_nearest_hvn(self, current_price, hvn_prices, direction='above'):
