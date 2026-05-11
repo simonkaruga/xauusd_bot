@@ -24,12 +24,19 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report
+from config import Config
 from logger import logger
 
 
-MODEL_PATH   = 'logs/signal_classifier.pkl'
-SCALER_PATH  = 'logs/signal_scaler.pkl'
-DRIFT_PATH   = 'logs/signal_drift_stats.pkl'
+MODEL_GBM_PATH = 'logs/signal_classifier_gbm.pkl'
+MODEL_RF_PATH  = 'logs/signal_classifier_rf.pkl'
+MODEL_PATH     = MODEL_GBM_PATH   # backward-compat alias
+SCALER_PATH    = 'logs/signal_scaler.pkl'
+DRIFT_PATH     = 'logs/signal_drift_stats.pkl'
+
+# Ensemble weights: GBM is more powerful but can overfit; RF more stable
+_GBM_WEIGHT = 0.60
+_RF_WEIGHT  = 0.40
 MIN_TRAINING_SAMPLES = 30
 PREDICTION_THRESHOLD = 0.55
 
@@ -50,7 +57,8 @@ DRIFT_MIN_SAMPLES  = 40
 
 class MLSignalClassifier:
     def __init__(self):
-        self.model = None
+        self.model = None        # GBM (primary)
+        self.model_rf = None     # Random Forest (ensemble member)
         self.scaler = StandardScaler()
         self.is_trained = False
         self.feature_names = []
@@ -63,82 +71,81 @@ class MLSignalClassifier:
     # ------------------------------------------------------------------
     # Feature engineering (same for training and live prediction)
     # ------------------------------------------------------------------
-    def _extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-
-        # Trend
-        df['ema9'] = ta.ema(df['close'], length=9)
+    # ------------------------------------------------------------------
+    # Feature group helpers — each covers one signal domain
+    # ------------------------------------------------------------------
+    def _feat_trend(self, df: pd.DataFrame) -> pd.DataFrame:
+        df['ema9']  = ta.ema(df['close'], length=9)
         df['ema21'] = ta.ema(df['close'], length=21)
         df['ema50'] = ta.ema(df['close'], length=50)
         df['ema_cross_pct'] = (df['ema9'] - df['ema21']) / df['ema21'] * 100
+        df['ema9_slope']    = df['ema9'].diff(3) / df['close'] * 100
+        df['ema50_dist']    = (df['close'] - df['ema50']) / df['close'] * 100
+        return df
 
-        # Trend slope (angle of EMA9 over last 3 bars)
-        df['ema9_slope'] = df['ema9'].diff(3) / df['close'] * 100
-
-        # Momentum
-        df['rsi'] = ta.rsi(df['close'], length=14)
+    def _feat_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
+        df['rsi']       = ta.rsi(df['close'], length=14)
         df['rsi_slope'] = df['rsi'].diff(3)
-        df['mom'] = df['close'].pct_change(5) * 100
+        df['mom']       = df['close'].pct_change(5) * 100
+        direction = (df['close'] > df['close'].shift(1)).astype(int) * 2 - 1
+        consec, streak, prev_d = [], 0, 0
+        for d in direction:
+            streak = streak + d if d == prev_d else d
+            consec.append(streak)
+            prev_d = d
+        df['consec_direction'] = consec
+        return df
 
-        # Volatility
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['atr_ratio'] = df['atr'] / df['close'] * 100   # ATR as % of price
-        df['atr_norm'] = df['atr'] / df['atr'].rolling(50).mean()  # vs average
-
-        # Bollinger bands
-        bbands = ta.bbands(df['close'], length=20)
-        df['bb_upper'] = bbands['BBU_20_2.0']
-        df['bb_lower'] = bbands['BBL_20_2.0']
-        df['bb_mid'] = bbands['BBM_20_2.0']
-        df['bb_pos'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid'] * 100
-
-        # ADX (trend strength)
+    def _feat_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
+        df['atr']      = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['atr_ratio'] = df['atr'] / df['close'] * 100
+        df['atr_norm']  = df['atr'] / df['atr'].rolling(50).mean()
+        bb = ta.bbands(df['close'], length=20)
+        df['bb_pos']   = (df['close'] - bb['BBL_20_2.0']) / (bb['BBU_20_2.0'] - bb['BBL_20_2.0'])
+        df['bb_width'] = (bb['BBU_20_2.0'] - bb['BBL_20_2.0']) / bb['BBM_20_2.0'] * 100
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-        df['adx'] = adx['ADX_14']
-        df['di_plus'] = adx['DMP_14']
-        df['di_minus'] = adx['DMN_14']
-        df['di_diff'] = df['di_plus'] - df['di_minus']
+        df['adx']    = adx['ADX_14']
+        df['di_diff'] = adx['DMP_14'] - adx['DMN_14']
+        return df
 
-        # Volume delta (approximated)
-        df['buy_vol'] = df['tick_volume'] * (df['close'] > df['open']).astype(float)
-        df['sell_vol'] = df['tick_volume'] * (df['close'] <= df['open']).astype(float)
+    def _feat_structure(self, df: pd.DataFrame) -> pd.DataFrame:
+        df['buy_vol']     = df['tick_volume'] * (df['close'] > df['open']).astype(float)
+        df['sell_vol']    = df['tick_volume'] * (df['close'] <= df['open']).astype(float)
         df['delta_ratio'] = (df['buy_vol'] - df['sell_vol']) / (df['tick_volume'] + 1e-9)
-
-        # OHLC patterns
-        df['body_pct'] = abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-9)
-        df['upper_wick'] = (df['high'] - df[['open', 'close']].max(axis=1)) / (df['high'] - df['low'] + 1e-9)
-        df['lower_wick'] = (df[['open', 'close']].min(axis=1) - df['low']) / (df['high'] - df['low'] + 1e-9)
-
-        # Session (hour of day, 0-23)
-        if 'time' in df.columns:
-            df['hour'] = pd.to_datetime(df['time']).dt.hour
-            df['session_london_ny'] = ((df['hour'] >= 12) & (df['hour'] < 16)).astype(float)
-        else:
-            df['hour'] = 12.0
-            df['session_london_ny'] = 1.0
-
-        # Price context: distance from recent high/low
+        hl_range = df['high'] - df['low'] + 1e-9
+        df['body_pct']    = abs(df['close'] - df['open']) / hl_range
+        df['upper_wick']  = (df['high'] - df[['open', 'close']].max(axis=1)) / hl_range
+        df['lower_wick']  = (df[['open', 'close']].min(axis=1) - df['low']) / hl_range
+        df['bar_range']   = df['high'] - df['low']
+        df['bar_velocity']   = df['bar_range'] / (df['bar_range'].rolling(10).mean() + 1e-9)
+        df['close_position'] = (df['close'] - df['low']) / (df['bar_range'] + 1e-9)
+        df['vol_trend']      = df['tick_volume'] / (df['tick_volume'].rolling(20).mean() + 1e-9)
         df['dist_from_high20'] = (df['high'].rolling(20).max() - df['close']) / df['close'] * 100
-        df['dist_from_low20'] = (df['close'] - df['low'].rolling(20).min()) / df['close'] * 100
-
-        # COT macro score — weekly, same value for all bars in a week
-        # Injected externally via set_cot_score(); defaults to 0.0 (neutral)
+        df['dist_from_low20']  = (df['close'] - df['low'].rolling(20).min()) / df['close'] * 100
+        if 'time' in df.columns:
+            hour = pd.to_datetime(df['time']).dt.hour
+            df['session_london_ny'] = ((hour >= 12) & (hour < 16)).astype(float)
+        else:
+            df['session_london_ny'] = 1.0
         df['cot_score'] = getattr(self, '_cot_score', 0.0)
+        return df
+
+    def _extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df = self._feat_trend(df)
+        df = self._feat_momentum(df)
+        df = self._feat_volatility(df)
+        df = self._feat_structure(df)
 
         feature_cols = [
-            'ema_cross_pct', 'ema9_slope',
-            'rsi', 'rsi_slope', 'mom',
-            'atr_ratio', 'atr_norm',
-            'bb_pos', 'bb_width',
-            'adx', 'di_diff',
-            'delta_ratio',
-            'body_pct', 'upper_wick', 'lower_wick',
-            'session_london_ny',
+            'ema_cross_pct', 'ema9_slope', 'ema50_dist',
+            'rsi', 'rsi_slope', 'mom', 'consec_direction',
+            'atr_ratio', 'atr_norm', 'bb_pos', 'bb_width', 'adx', 'di_diff',
+            'delta_ratio', 'body_pct', 'upper_wick', 'lower_wick',
+            'bar_velocity', 'close_position', 'vol_trend',
             'dist_from_high20', 'dist_from_low20',
-            'cot_score',          # CFTC commercial net position: -1 to +1
+            'session_london_ny', 'cot_score',
         ]
-
         self.feature_names = feature_cols
         return df[feature_cols]
 
@@ -195,7 +202,7 @@ class MLSignalClassifier:
         avg_cv_score = np.mean(scores)
         logger.info(f"ML Classifier CV accuracy: {avg_cv_score:.3f} (folds: {scores})")
 
-        # Train final model on all data
+        # Train final ensemble on all data
         self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(X)
 
@@ -204,12 +211,24 @@ class MLSignalClassifier:
             subsample=0.8, random_state=42
         )
         self.model.fit(X_scaled, y)
+
+        self.model_rf = RandomForestClassifier(
+            n_estimators=300, max_depth=6, random_state=42,
+            class_weight='balanced', n_jobs=-1,
+            min_samples_leaf=3,      # prevents overfitting on small samples
+        )
+        self.model_rf.fit(X_scaled, y)
         self.is_trained = True
 
-        # Feature importance
+        # Feature importance from GBM (more informative than RF for this use case)
         importances = self.model.feature_importances_
         top5 = sorted(zip(self.feature_names, importances), key=lambda x: -x[1])[:5]
-        logger.info(f"Top 5 signal features: {[(n, round(v, 3)) for n, v in top5]}")
+        logger.info(f"Top 5 signal features (GBM): {[(n, round(v, 3)) for n, v in top5]}")
+
+        # Cross-check RF importances
+        rf_importances = self.model_rf.feature_importances_
+        rf_top3 = sorted(zip(self.feature_names, rf_importances), key=lambda x: -x[1])[:3]
+        logger.info(f"Top 3 signal features (RF): {[(n, round(v, 3)) for n, v in rf_top3]}")
 
         # Save training distribution (deciles per feature) for PSI drift detection
         self._train_dist = {}
@@ -258,10 +277,21 @@ class MLSignalClassifier:
 
             X = raw_vec.reshape(1, -1)
             X_scaled = self.scaler.transform(X)
-            proba = self.model.predict_proba(X_scaled)[0]
-            win_prob = float(proba[1]) if len(proba) > 1 else 0.5
 
-            logger.info(f"ML Signal Score: {win_prob:.3f} (threshold={PREDICTION_THRESHOLD})")
+            gbm_prob = float(self.model.predict_proba(X_scaled)[0][1]) \
+                if hasattr(self.model, 'predict_proba') else 0.5
+
+            if self.model_rf is not None:
+                rf_prob = float(self.model_rf.predict_proba(X_scaled)[0][1])
+                win_prob = _GBM_WEIGHT * gbm_prob + _RF_WEIGHT * rf_prob
+                logger.info(
+                    f"ML Ensemble: GBM={gbm_prob:.3f} RF={rf_prob:.3f} "
+                    f"→ {win_prob:.3f} (threshold={PREDICTION_THRESHOLD})"
+                )
+            else:
+                win_prob = gbm_prob
+                logger.info(f"ML Signal Score (GBM only): {win_prob:.3f}")
+
             return win_prob
 
         except Exception as e:
@@ -372,34 +402,47 @@ class MLSignalClassifier:
 
     def should_trade(self, df: pd.DataFrame, direction: str = 'BUY') -> bool:
         score = self.predict(df, direction)
-        return score >= PREDICTION_THRESHOLD
+        threshold = getattr(Config, 'ML_PREDICTION_THRESHOLD', PREDICTION_THRESHOLD)
+        return score >= threshold
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
     def _save(self):
         os.makedirs('logs', exist_ok=True)
-        with open(MODEL_PATH, 'wb') as f:
+        with open(MODEL_GBM_PATH, 'wb') as f:
             pickle.dump(self.model, f)
+        if self.model_rf is not None:
+            with open(MODEL_RF_PATH, 'wb') as f:
+                pickle.dump(self.model_rf, f)
         with open(SCALER_PATH, 'wb') as f:
             pickle.dump(self.scaler, f)
         if self._train_dist:
             with open(DRIFT_PATH, 'wb') as f:
                 pickle.dump({'train_dist': self._train_dist,
                              'feature_names': self.feature_names}, f)
+        logger.info(f"ML Ensemble saved: GBM + {'RF' if self.model_rf else 'none'}")
 
     def _load(self):
-        if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
+        if os.path.exists(MODEL_GBM_PATH) and os.path.exists(SCALER_PATH):
             try:
-                with open(MODEL_PATH, 'rb') as f:
+                with open(MODEL_GBM_PATH, 'rb') as f:
                     self.model = pickle.load(f)
                 with open(SCALER_PATH, 'rb') as f:
                     self.scaler = pickle.load(f)
                 self.is_trained = True
-                logger.info("ML Classifier: loaded saved model")
+                logger.info("ML Classifier: loaded GBM model")
             except Exception as e:
-                logger.warning(f"ML Classifier: could not load model: {e}")
+                logger.warning(f"ML Classifier: could not load GBM model: {e}")
                 self.is_trained = False
+
+        if os.path.exists(MODEL_RF_PATH):
+            try:
+                with open(MODEL_RF_PATH, 'rb') as f:
+                    self.model_rf = pickle.load(f)
+                logger.info("ML Classifier: loaded RF model (ensemble active)")
+            except Exception as e:
+                logger.warning(f"ML Classifier: could not load RF model: {e}")
 
         if os.path.exists(DRIFT_PATH):
             try:

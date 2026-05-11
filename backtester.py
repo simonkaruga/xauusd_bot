@@ -81,24 +81,72 @@ class Backtester:
             df_sim['time'] = df_sim['time'].astype('int64') // 10**9
             sim_by_time = df_sim.set_index('time')
 
+        # Pre-compute historical session anchors (Asian range, PDH/PDL, weekly open)
+        # so generate_signal() receives real anchor levels for every bar, not None.
+        anchors_by_date = self._precompute_anchors(df_m15)
+
         for i in range(100, len(df_m15)):
             window = df_m15.iloc[:i + 1].copy()
             m15_bar = window.iloc[-1]
             m15_time = int(pd.Timestamp(m15_bar['time']).timestamp())
 
-            # --- SL/TP check at M1 resolution ---
+            # --- Position management: time stop / trailing SL / partial close / SL/TP ---
             if position:
+                bars_held = i - position['entry_bar']
+
+                # Time stop: liquidate after N bars of dead capital
+                if Config.USE_TIME_STOP and bars_held >= Config.TIME_STOP_BARS:
+                    exit_price = float(m15_bar['close'])
+                    pnl = self._calc_pnl(position, exit_price, include_costs,
+                                         exit_time=m15_bar['time'])
+                    balance += pnl
+                    self.trades.append({**position, 'exit': exit_price, 'profit': pnl,
+                                        'exit_bar': i, 'exit_time': m15_bar['time'],
+                                        'exit_reason': 'time_stop'})
+                    position = None
+                    equity_curve.append(balance)
+                    continue
+
                 if sim_by_time is not None:
-                    # Find all M1 bars within this M15 bar's 15-minute window
-                    end_time = m15_time + 899  # 14:59 into the candle
-                    start_time = m15_time
+                    end_time = m15_time + 899
                     m1_slice = sim_by_time.loc[
-                        (sim_by_time.index >= start_time) &
+                        (sim_by_time.index >= m15_time) &
                         (sim_by_time.index <= end_time)
                     ]
-                    hit, exit_price = self._check_sl_tp_m1(position, m1_slice)
+                    partial_rec, hit, exit_price = self._manage_position_m1(
+                        position, m1_slice, include_costs
+                    )
                 else:
+                    # M15 path: update trailing SL, check TP1, then full SL/TP
+                    self._update_trailing_sl(position,
+                                             float(m15_bar['high']), float(m15_bar['low']))
+                    tp1_now, tp1_price = self._check_tp1(
+                        position, float(m15_bar['high']), float(m15_bar['low'])
+                    )
+                    if tp1_now:
+                        partial_size = round(position['size'] * Config.TP1_FRACTION, 2)
+                        pnl_p = self._calc_pnl_sized(
+                            position, tp1_price, partial_size, include_costs, m15_bar['time']
+                        )
+                        balance += pnl_p
+                        self.trades.append({**position, 'exit': tp1_price, 'profit': pnl_p,
+                                            'size': partial_size, 'exit_bar': i,
+                                            'exit_time': m15_bar['time'],
+                                            'exit_reason': 'tp1_partial'})
+                        position['size'] = max(0.01, round(position['size'] - partial_size, 2))
+                        position['tp1_hit'] = True
+                        position['sl'] = position['entry']
+                    partial_rec = None
                     hit, exit_price = self._check_sl_tp(position, m15_bar)
+
+                # Record TP1 partial close from M1 path
+                if partial_rec is not None:
+                    balance += partial_rec['pnl']
+                    self.trades.append({**position, 'exit': partial_rec['price'],
+                                        'profit': partial_rec['pnl'],
+                                        'size': partial_rec['size'],
+                                        'exit_bar': i, 'exit_time': m15_bar['time'],
+                                        'exit_reason': 'tp1_partial'})
 
                 if hit:
                     pnl = self._calc_pnl(position, exit_price, include_costs,
@@ -112,7 +160,10 @@ class Backtester:
 
             # --- Generate signal on M15 bars (session-filtered by bar time) ---
             if not position and self._bar_in_session(m15_bar['time']):
-                signal = self.strategy.generate_signal(window)
+                bar_date = str(pd.Timestamp(m15_bar['time']).date())
+                signal = self.strategy.generate_signal(
+                    window, anchors=anchors_by_date.get(bar_date, {})
+                )
                 if signal:
                     risk_amount = balance * Config.RISK_PER_TRADE
                     price_diff = abs(signal['price'] - signal['sl'])
@@ -129,17 +180,22 @@ class Backtester:
                         signal['price'], signal['type'], atr, m15_bar['time']
                     )
 
+                    direction = 1 if signal['type'] == 'BUY' else -1
+                    tp1_price = round(fill_price + atr * Config.ATR_MULTIPLIER_TP1 * direction, 2)
                     position = {
                         'type': signal['type'],
                         'entry': fill_price,
                         'sl': signal['sl'],
                         'tp': signal['tp'],
+                        'tp1': tp1_price,
+                        'tp1_hit': False,
                         'size': size,
                         'entry_bar': i,
                         'entry_time': m15_bar['time'],
                         'atr': atr,
                         'regime': signal.get('regime', 'unknown'),
                         'session': self._classify_session(m15_bar['time']),
+                        'entry_type': signal.get('entry_type', 'PULLBACK'),
                     }
 
             equity_curve.append(balance)
@@ -181,20 +237,65 @@ class Backtester:
             df_s['_ts'] = df_s['time'].astype('int64') // 10 ** 9
             sim_by_time = df_s.set_index('_ts')
 
+        anchors_by_date = self._precompute_anchors(df_m15)
+
         for i in range(100, len(df_m15)):
             window = df_m15.iloc[:i + 1].copy()
             m15_bar = window.iloc[-1]
             m15_time = int(pd.Timestamp(m15_bar['time']).timestamp())
 
             if position:
+                bars_held = i - position['entry_bar']
+
+                if Config.USE_TIME_STOP and bars_held >= Config.TIME_STOP_BARS:
+                    exit_price = float(m15_bar['close'])
+                    pnl = self._calc_pnl(position, exit_price, include_costs,
+                                         exit_time=m15_bar['time'])
+                    balance += pnl
+                    self.trades.append({**position, 'exit': exit_price, 'profit': pnl,
+                                        'exit_bar': i, 'exit_time': m15_bar['time'],
+                                        'exit_reason': 'time_stop'})
+                    position = None
+                    equity_curve.append(balance)
+                    continue
+
                 if sim_by_time is not None:
                     m1_slice = sim_by_time.loc[
                         (sim_by_time.index >= m15_time) &
                         (sim_by_time.index <= m15_time + 899)
                     ]
-                    hit, exit_price = self._check_sl_tp_m1(position, m1_slice)
+                    partial_rec, hit, exit_price = self._manage_position_m1(
+                        position, m1_slice, include_costs
+                    )
                 else:
+                    self._update_trailing_sl(position,
+                                             float(m15_bar['high']), float(m15_bar['low']))
+                    tp1_now, tp1_price = self._check_tp1(
+                        position, float(m15_bar['high']), float(m15_bar['low'])
+                    )
+                    if tp1_now:
+                        partial_size = round(position['size'] * Config.TP1_FRACTION, 2)
+                        pnl_p = self._calc_pnl_sized(
+                            position, tp1_price, partial_size, include_costs, m15_bar['time']
+                        )
+                        balance += pnl_p
+                        self.trades.append({**position, 'exit': tp1_price, 'profit': pnl_p,
+                                            'size': partial_size, 'exit_bar': i,
+                                            'exit_time': m15_bar['time'],
+                                            'exit_reason': 'tp1_partial'})
+                        position['size'] = max(0.01, round(position['size'] - partial_size, 2))
+                        position['tp1_hit'] = True
+                        position['sl'] = position['entry']
+                    partial_rec = None
                     hit, exit_price = self._check_sl_tp(position, m15_bar)
+
+                if partial_rec is not None:
+                    balance += partial_rec['pnl']
+                    self.trades.append({**position, 'exit': partial_rec['price'],
+                                        'profit': partial_rec['pnl'],
+                                        'size': partial_rec['size'],
+                                        'exit_bar': i, 'exit_time': m15_bar['time'],
+                                        'exit_reason': 'tp1_partial'})
 
                 if hit:
                     pnl = self._calc_pnl(position, exit_price, include_costs,
@@ -207,7 +308,10 @@ class Backtester:
                     continue
 
             if not position:
-                signal = self.strategy.generate_signal(window)
+                bar_date = str(pd.Timestamp(m15_bar['time']).date())
+                signal = self.strategy.generate_signal(
+                    window, anchors=anchors_by_date.get(bar_date, {})
+                )
                 if signal:
                     risk_amount = balance * Config.RISK_PER_TRADE
                     price_diff = abs(signal['price'] - signal['sl'])
@@ -224,17 +328,22 @@ class Backtester:
                         signal['price'], signal['type'], atr, m15_bar['time']
                     )
 
+                    direction = 1 if signal['type'] == 'BUY' else -1
+                    tp1_price = round(fill_price + atr * Config.ATR_MULTIPLIER_TP1 * direction, 2)
                     position = {
                         'type': signal['type'],
                         'entry': fill_price,
                         'sl': signal['sl'],
                         'tp': signal['tp'],
+                        'tp1': tp1_price,
+                        'tp1_hit': False,
                         'size': size,
                         'entry_bar': i,
                         'entry_time': m15_bar['time'],
                         'atr': atr,
                         'regime': signal.get('regime', 'unknown'),
                         'session': self._classify_session(m15_bar['time']),
+                        'entry_type': signal.get('entry_type', 'PULLBACK'),
                     }
 
             equity_curve.append(balance)
@@ -263,22 +372,37 @@ class Backtester:
         return False, None
 
     # ------------------------------------------------------------------
-    # Bar simulation: check if SL or TP was hit within the bar
-    # Professional approach: check worst-case first (assume SL hits before TP)
+    # Bar simulation: check if SL or TP was hit within the bar.
+    # When both levels are inside the bar's range, use bar open distance
+    # to infer which level price reached first (conservative but unbiased).
     # ------------------------------------------------------------------
     def _check_sl_tp(self, position, bar):
-        high = bar['high']
-        low = bar['low']
+        high  = bar['high']
+        low   = bar['low']
+        open_ = bar['open']
 
         if position['type'] == 'BUY':
-            if low <= position['sl']:
+            sl_hit = low  <= position['sl']
+            tp_hit = high >= position['tp']
+            if sl_hit and tp_hit:
+                # Ambiguous bar: whichever level was closer to open price hit first
+                if abs(open_ - position['sl']) <= abs(open_ - position['tp']):
+                    return True, position['sl']
+                return True, position['tp']
+            if sl_hit:
                 return True, position['sl']
-            if high >= position['tp']:
+            if tp_hit:
                 return True, position['tp']
         else:
-            if high >= position['sl']:
+            sl_hit = high >= position['sl']
+            tp_hit = low  <= position['tp']
+            if sl_hit and tp_hit:
+                if abs(open_ - position['sl']) <= abs(open_ - position['tp']):
+                    return True, position['sl']
+                return True, position['tp']
+            if sl_hit:
                 return True, position['sl']
-            if low <= position['tp']:
+            if tp_hit:
                 return True, position['tp']
 
         return False, None
@@ -474,6 +598,7 @@ class Backtester:
         # --- Performance attribution ---
         by_session = self._attribute(self.trades, 'session')
         by_regime = self._attribute(self.trades, 'regime')
+        by_entry_type = self._attribute(self.trades, 'entry_type')
         by_dow = self._attribute_dow(self.trades)
 
         # --- Monte Carlo (1000 paths via trade shuffling) ---
@@ -506,6 +631,7 @@ class Backtester:
             'avg_trade_duration_bars': self._avg_duration(),
             'by_session': by_session,
             'by_regime': by_regime,
+            'by_entry_type': by_entry_type,
             'by_day_of_week': by_dow,
             'monte_carlo': mc,
             'costs_included': True,
@@ -654,6 +780,136 @@ class Backtester:
             'count': len(durations),
         }
 
+    # ------------------------------------------------------------------
+    # Position management helpers
+    # ------------------------------------------------------------------
+    def _update_trailing_sl(self, position: dict, bar_high: float, bar_low: float) -> None:
+        """Move SL to breakeven then trail behind price once BREAKEVEN_TRIGGER is met."""
+        if not Config.ENABLE_TRAILING_STOP:
+            return
+        entry = position['entry']
+        sl    = position['sl']
+        atr   = position.get('atr', 1.0)
+        risk  = abs(entry - sl)
+        if risk == 0:
+            return
+        if position['type'] == 'BUY':
+            if bar_high >= entry + risk * Config.BREAKEVEN_TRIGGER:
+                trail = bar_high - atr * Config.TRAILING_DISTANCE
+                position['sl'] = round(max(sl, entry, trail), 2)
+        else:
+            if bar_low <= entry - risk * Config.BREAKEVEN_TRIGGER:
+                trail = bar_low + atr * Config.TRAILING_DISTANCE
+                position['sl'] = round(min(sl, entry, trail), 2)
+
+    def _check_tp1(self, position: dict, bar_high: float, bar_low: float) -> tuple:
+        """Return (hit, tp1_price) for the partial-close first target."""
+        if position.get('tp1_hit') or not Config.USE_PARTIAL_CLOSE:
+            return False, None
+        tp1 = position.get('tp1')
+        if tp1 is None:
+            return False, None
+        if position['type'] == 'BUY'  and bar_high >= tp1:
+            return True, tp1
+        if position['type'] == 'SELL' and bar_low  <= tp1:
+            return True, tp1
+        return False, None
+
+    def _calc_pnl_sized(self, position: dict, exit_price: float, size: float,
+                         include_costs: bool, exit_time) -> float:
+        """P&L for a specific lot size — used for TP1 partial closes."""
+        direction = 1 if position['type'] == 'BUY' else -1
+        raw = (exit_price - position['entry']) * direction * size * CONTRACT_SIZE
+        if include_costs:
+            spread_mult = self._news_spread_multiplier(position.get('entry_time'))
+            raw -= SPREAD_POINTS * spread_mult * size * CONTRACT_SIZE
+            raw -= COMMISSION_PER_LOT * size
+        return raw
+
+    def _manage_position_m1(self, position: dict, m1_slice, include_costs: bool) -> tuple:
+        """
+        Walk M1 bars: update trailing SL, check TP1 partial close, then check SL/TP.
+        Returns (partial_record | None, hit: bool, exit_price | None).
+        Modifies position dict in place (sl, size, tp1_hit).
+        """
+        partial_rec = None
+        for bar_ts, bar in m1_slice.iterrows():
+            bar_high = float(bar['high'])
+            bar_low  = float(bar['low'])
+
+            self._update_trailing_sl(position, bar_high, bar_low)
+
+            if partial_rec is None:
+                tp1_hit, tp1_price = self._check_tp1(position, bar_high, bar_low)
+                if tp1_hit:
+                    partial_size = round(position['size'] * Config.TP1_FRACTION, 2)
+                    pnl_p = self._calc_pnl_sized(
+                        position, tp1_price, partial_size, include_costs, bar_ts
+                    )
+                    partial_rec = {'price': tp1_price, 'size': partial_size, 'pnl': pnl_p}
+                    position['size'] = max(0.01, round(position['size'] - partial_size, 2))
+                    position['tp1_hit'] = True
+                    position['sl'] = position['entry']
+
+            hit, price = self._check_sl_tp(position, bar)
+            if hit:
+                return partial_rec, True, price
+
+        return partial_rec, False, None
+
+    # ------------------------------------------------------------------
+    # Pre-compute historical session anchor levels for every trading date
+    # so the backtester can pass real Asian range / PDH / PDL / weekly open
+    # to generate_signal() instead of None — enabling proper simulation of
+    # the BREAKOUT and REACTION entry types.
+    # O(N) upfront, O(1) lookup per bar during the simulation loop.
+    # ------------------------------------------------------------------
+    def _precompute_anchors(self, df: pd.DataFrame) -> dict:
+        from datetime import timedelta
+
+        df_t = df.copy()
+        df_t['_dt']   = pd.to_datetime(df_t['time'])
+        df_t['_date'] = df_t['_dt'].dt.date
+        df_t['_hour'] = df_t['_dt'].dt.hour
+        df_t['_dow']  = df_t['_dt'].dt.dayofweek
+
+        unique_dates = sorted(df_t['_date'].unique())
+        anchors: dict = {}
+
+        for idx, date in enumerate(unique_dates):
+            day_bars   = df_t[df_t['_date'] == date]
+            asian_bars = day_bars[day_bars['_hour'] < 8]
+
+            if len(asian_bars) >= 4:
+                ah = float(asian_bars['high'].max())
+                al = float(asian_bars['low'].min())
+                ar = ah - al
+            else:
+                ah = al = ar = None
+
+            pdh = pdl = None
+            if idx > 0:
+                prev_bars = df_t[df_t['_date'] == unique_dates[idx - 1]]
+                if len(prev_bars) >= 16:
+                    pdh = float(prev_bars['high'].max())
+                    pdl = float(prev_bars['low'].min())
+
+            dow = int(day_bars['_dow'].iloc[0]) if len(day_bars) > 0 else 0
+            mon_date = date - timedelta(days=dow)
+            mon_bars = df_t[df_t['_date'] == mon_date]
+            weekly_open = float(mon_bars['open'].iloc[0]) if len(mon_bars) > 0 else None
+
+            anchors[str(date)] = {
+                'asian_high':  ah,
+                'asian_low':   al,
+                'asian_range': ar,
+                'pdh':         pdh,
+                'pdl':         pdl,
+                'weekly_open': weekly_open,
+            }
+
+        return anchors
+
     def _print_report(self, r):
         logger.info("=" * 55)
         logger.info("          BACKTEST RESULTS (WITH COSTS)")
@@ -681,6 +937,10 @@ class Backtester:
             logger.info(f"    5th pct final : ${mc['p5_final']}")
             logger.info(f"    Ruin prob (<50%): {mc['ruin_probability']}%")
             logger.info(f"    Worst DD (p95): {mc['worst_drawdown_p95_pct']}%")
+        logger.info("-" * 55)
+        logger.info("  By Entry Type:")
+        for s, v in r.get('by_entry_type', {}).items():
+            logger.info(f"    {s:<12}: {v['trades']} trades | WR {v['win_rate']}% | P&L ${v['profit']}")
         logger.info("-" * 55)
         logger.info("  By Session:")
         for s, v in r['by_session'].items():

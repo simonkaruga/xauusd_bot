@@ -11,12 +11,16 @@ Professional quant-grade optimization with:
 import os
 import numpy as np
 import pandas as pd
-from datetime import datetime
-from itertools import combinations
+from datetime import datetime, timezone
+from itertools import combinations, product
 from scipy.stats import norm
 from backtester import Backtester
 from config import Config
 from logger import logger
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # Path where optimized params are written so they survive process restarts
 _OPT_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env.optimized')
@@ -38,14 +42,18 @@ class WalkForwardOptimizer:
         logger.info(f"Walk-forward optimization | train={train_days}d | test={test_days}d")
 
         _original = {
-            'FAST_EMA': Config.FAST_EMA, 'SLOW_EMA': Config.SLOW_EMA,
-            'RSI_BUY_MIN': Config.RSI_BUY_MIN, 'RSI_BUY_MAX': Config.RSI_BUY_MAX,
-            'ATR_MULTIPLIER_TP': Config.ATR_MULTIPLIER_TP,
+            'FAST_EMA':                   Config.FAST_EMA,
+            'SLOW_EMA':                   Config.SLOW_EMA,
+            'ATR_MULTIPLIER_SL':          Config.ATR_MULTIPLIER_SL,
+            'ATR_MULTIPLIER_TP':          Config.ATR_MULTIPLIER_TP,
+            'MACRO_CONVICTION_THRESHOLD': Config.MACRO_CONVICTION_THRESHOLD,
         }
         param_grid = {
-            'FAST_EMA': [7, 9, 12], 'SLOW_EMA': [18, 21, 26],
-            'RSI_BUY_MIN': [40, 45, 50], 'RSI_BUY_MAX': [60, 65, 70],
-            'ATR_MULTIPLIER_TP': [3.0, 4.0, 5.0],
+            'FAST_EMA':                   [7, 9, 12],
+            'SLOW_EMA':                   [18, 21, 26],
+            'ATR_MULTIPLIER_SL':          [1.5, 2.0, 2.5],
+            'ATR_MULTIPLIER_TP':          [4.0, 5.0, 6.0],
+            'MACRO_CONVICTION_THRESHOLD': [0.30, 0.40, 0.50],
         }
 
         in_sample_results = self._run_grid_search(symbol, train_days, initial_balance, param_grid)
@@ -96,38 +104,47 @@ class WalkForwardOptimizer:
     def _run_grid_search(self, symbol: str, train_days: int,
                           initial_balance: float, param_grid: dict) -> list:
         """Run all parameter combinations in-sample. Returns list of result dicts."""
+        keys = list(param_grid.keys())
+        combos = list(product(*[param_grid[k] for k in keys]))
+        total = len(combos)
         results = []
-        for fast in param_grid['FAST_EMA']:
-            for slow in param_grid['SLOW_EMA']:
-                if fast >= slow:
-                    continue
-                for rsi_min in param_grid['RSI_BUY_MIN']:
-                    for rsi_max in param_grid['RSI_BUY_MAX']:
-                        if rsi_min >= rsi_max:
-                            continue
-                        for tp_mult in param_grid['ATR_MULTIPLIER_TP']:
-                            Config.FAST_EMA = fast
-                            Config.SLOW_EMA = slow
-                            Config.RSI_BUY_MIN = rsi_min
-                            Config.RSI_BUY_MAX = rsi_max
-                            Config.ATR_MULTIPLIER_TP = tp_mult
-                            result = self.backtester.run(symbol, days=train_days,
-                                                         initial_balance=initial_balance)
-                            if not result or 'error' in result:
-                                continue
-                            results.append({
-                                'params': {
-                                    'FAST_EMA': fast, 'SLOW_EMA': slow,
-                                    'RSI_BUY_MIN': rsi_min, 'RSI_BUY_MAX': rsi_max,
-                                    'ATR_MULTIPLIER_TP': tp_mult,
-                                },
-                                'is_sharpe': result.get('sharpe_ratio', 0),
-                                'is_pf': result.get('profit_factor', 0),
-                                'is_wr': result.get('win_rate', 0),
-                                'is_return': result.get('return_pct', 0),
-                                'is_dd': result.get('max_drawdown_pct', 100),
-                                'is_trades': result.get('total_trades', 0),
-                            })
+
+        for i, vals in enumerate(combos):
+            params = dict(zip(keys, vals))
+
+            # Skip EMA combos where fast >= slow
+            fast = params.get('FAST_EMA', 0)
+            slow = params.get('SLOW_EMA', 1)
+            if fast >= slow:
+                continue
+
+            # Skip ATR combos where SL >= TP (can't have R:R > 1 otherwise)
+            sl_mult = params.get('ATR_MULTIPLIER_SL', 0)
+            tp_mult = params.get('ATR_MULTIPLIER_TP', 1)
+            if sl_mult >= tp_mult:
+                continue
+
+            for k, v in params.items():
+                setattr(Config, k, v)
+
+            result = self.backtester.run(symbol, days=train_days,
+                                         initial_balance=initial_balance)
+            if not result or 'error' in result:
+                continue
+
+            results.append({
+                'params': params,
+                'is_sharpe': result.get('sharpe_ratio', 0),
+                'is_pf': result.get('profit_factor', 0),
+                'is_wr': result.get('win_rate', 0),
+                'is_return': result.get('return_pct', 0),
+                'is_dd': result.get('max_drawdown_pct', 100),
+                'is_trades': result.get('total_trades', 0),
+            })
+
+            if (i + 1) % 10 == 0:
+                logger.info(f"Grid search: {i+1}/{total} combinations tested")
+
         return results
 
     def _validate_oos(self, params: dict, symbol: str,
@@ -166,94 +183,94 @@ class WalkForwardOptimizer:
     # n_groups=6, n_test=2 → C(6,2)=15 OOS paths covering 2/6=33% of data
     # each, overlapping in training so every bar is OOS in multiple paths.
     # ------------------------------------------------------------------
+    def _fetch_cpcv_data(self, symbol: str, total_days: int) -> tuple:
+        """Connect (if needed), fetch M15 + M1 data, disconnect. Returns (df_m15, df_m1)."""
+        connector = self.backtester.connector
+        connected_here = False
+        if not connector.is_connected():
+            if not connector.connect():
+                logger.error("CPCV: MT5 connection failed")
+                return None, None
+            connected_here = True
+        try:
+            df_m15 = connector.get_bars(symbol, Config.TIMEFRAME, total_days * 24 * 4)
+            if df_m15 is None or len(df_m15) < 200:
+                logger.error("CPCV: insufficient M15 data")
+                return None, None
+            df_m1 = connector.get_bars(symbol, 'M1', min(total_days * 24 * 60, 99_000))
+        finally:
+            if connected_here:
+                connector.disconnect()
+        return df_m15, df_m1
+
+    def _align_m1_to_groups(self, df_m1, groups: list) -> list:
+        """Slice M1 bars to match each M15 group's time window."""
+        m1_groups = [None] * len(groups)
+        if df_m1 is None or len(df_m1) == 0:
+            return m1_groups
+        df_m1 = df_m1.copy()
+        df_m1['time'] = pd.to_datetime(df_m1['time'])
+        for gi, g in enumerate(groups):
+            t_start = pd.Timestamp(g.iloc[0]['time'])
+            t_end   = pd.Timestamp(g.iloc[-1]['time'])
+            sl = df_m1[(df_m1['time'] >= t_start) & (df_m1['time'] <= t_end)]
+            m1_groups[gi] = sl if len(sl) > 0 else None
+        return m1_groups
+
+    def _log_cpcv_result(self, result: dict) -> None:
+        logger.info("=" * 55)
+        logger.info("  CPCV RESULTS (%d paths)", result['n_paths'])
+        logger.info("  Median OOS Sharpe : %.3f", result['median_oos_sharpe'])
+        logger.info("  P25 OOS Sharpe    : %.3f  (pessimistic)", result['p25_oos_sharpe'])
+        logger.info("  P75 OOS Sharpe    : %.3f  (optimistic)", result['p75_oos_sharpe'])
+        logger.info("  Consistency       : %.1f%% paths profitable", result['consistency_pct'])
+        logger.info("  Robust            : %s", result['is_robust'])
+        if not result['is_robust']:
+            logger.warning(
+                "CPCV: strategy is NOT robust — performance varies widely across "
+                "paths. Consider widening param ranges or reducing complexity."
+            )
+        logger.info("=" * 55)
+
     def cpcv_validate(self, symbol: str = 'XAUUSD', params: dict = None,
                       total_days: int = 120, n_groups: int = 6, n_test: int = 2,
                       initial_balance: float = None) -> dict:
         """
         Fetch data once, divide into n_groups, run C(n_groups, n_test)
         IS/OOS backtests. Returns distribution of OOS Sharpe ratios.
-
-        params: parameter dict to apply before running (uses self.best_params if None)
-        Returns: {
-            'oos_sharpes': [...],     # one per test combination
-            'median_oos_sharpe': x,
-            'p25_oos_sharpe': x,      # 25th pct — pessimistic estimate
-            'consistency': x,         # % of paths with positive Sharpe
-            'is_robust': bool,        # True if p25 > 0 and consistency > 60%
-        }
         """
         params = params or self.best_params
         if not params:
             logger.warning("CPCV: no params supplied, using current Config values")
-
-        initial_balance = initial_balance or Config.SIMULATED_BALANCE
-
-        # Apply params
         if params:
             for k, v in params.items():
                 setattr(Config, k, v)
+        initial_balance = initial_balance or Config.SIMULATED_BALANCE
 
-        # Fetch full data once — connect if not already connected
         logger.info(f"CPCV: fetching {total_days}d of M15 data for {symbol}")
-        connector = self.backtester.connector
-        connected_here = False
-        if not connector.is_connected():
-            if not connector.connect():
-                logger.error("CPCV: MT5 connection failed")
-                return {}
-            connected_here = True
+        df_m15, df_m1 = self._fetch_cpcv_data(symbol, total_days)
+        if df_m15 is None:
+            return {}
 
-        try:
-            m15_bars = total_days * 24 * 4
-            df_m15 = connector.get_bars(symbol, Config.TIMEFRAME, m15_bars)
-            if df_m15 is None or len(df_m15) < 200:
-                logger.error("CPCV: insufficient M15 data")
-                return {}
-
-            m1_bars = min(total_days * 24 * 60, 99_000)
-            df_m1 = connector.get_bars(symbol, 'M1', m1_bars)
-        finally:
-            if connected_here:
-                connector.disconnect()
-
-        # Split into n_groups contiguous slices
-        n = len(df_m15)
-        group_size = n // n_groups
-        groups = [df_m15.iloc[i * group_size:(i + 1) * group_size].copy()
-                  for i in range(n_groups)]
-
-        # M1 slices aligned to M15 groups (by timestamp)
-        m1_groups = [None] * n_groups
-        if df_m1 is not None and len(df_m1) > 0:
-            df_m1 = df_m1.copy()
-            df_m1['time'] = pd.to_datetime(df_m1['time'])
-            for gi, g in enumerate(groups):
-                t_start = pd.Timestamp(g.iloc[0]['time'])
-                t_end   = pd.Timestamp(g.iloc[-1]['time'])
-                slice_m1 = df_m1[(df_m1['time'] >= t_start) & (df_m1['time'] <= t_end)]
-                m1_groups[gi] = slice_m1 if len(slice_m1) > 0 else None
+        group_size = len(df_m15) // n_groups
+        groups    = [df_m15.iloc[i * group_size:(i + 1) * group_size].copy()
+                     for i in range(n_groups)]
+        m1_groups = self._align_m1_to_groups(df_m1, groups)
 
         test_combos = list(combinations(range(n_groups), n_test))
         logger.info(f"CPCV: {n_groups} groups × C({n_groups},{n_test})={len(test_combos)} paths")
 
         oos_sharpes, is_sharpes = [], []
-
         for combo in test_combos:
-            test_idx  = set(combo)
-            train_idx = [i for i in range(n_groups) if i not in test_idx]
-
-            # Concatenate IS and OOS dataframes
-            df_is  = pd.concat([groups[i] for i in train_idx], ignore_index=True)
-            df_oos = pd.concat([groups[i] for i in combo],     ignore_index=True)
-
-            m1_is_parts  = [m1_groups[i] for i in train_idx  if m1_groups[i] is not None]
-            m1_oos_parts = [m1_groups[i] for i in combo       if m1_groups[i] is not None]
+            train_idx    = [i for i in range(n_groups) if i not in set(combo)]
+            df_is        = pd.concat([groups[i]    for i in train_idx], ignore_index=True)
+            df_oos       = pd.concat([groups[i]    for i in combo],     ignore_index=True)
+            m1_is_parts  = [m1_groups[i] for i in train_idx if m1_groups[i] is not None]
+            m1_oos_parts = [m1_groups[i] for i in combo     if m1_groups[i] is not None]
             m1_is  = pd.concat(m1_is_parts,  ignore_index=True) if m1_is_parts  else None
             m1_oos = pd.concat(m1_oos_parts, ignore_index=True) if m1_oos_parts else None
-
             r_is  = self.backtester.run_on_df(df_is,  m1_is,  initial_balance)
             r_oos = self.backtester.run_on_df(df_oos, m1_oos, initial_balance)
-
             if r_is  and 'error' not in r_is:
                 is_sharpes.append(r_is.get('sharpe_ratio', 0))
             if r_oos and 'error' not in r_oos:
@@ -263,38 +280,20 @@ class WalkForwardOptimizer:
             logger.error("CPCV: no valid OOS results")
             return {}
 
-        arr = np.array(oos_sharpes)
-        median_oos = float(np.median(arr))
+        arr        = np.array(oos_sharpes)
         p25_oos    = float(np.percentile(arr, 25))
         consistency = float((arr > 0).mean() * 100)
-        is_robust   = (p25_oos > 0) and (consistency >= 60.0)
-
         result = {
-            'oos_sharpes':        [round(s, 3) for s in oos_sharpes],
-            'is_sharpes':         [round(s, 3) for s in is_sharpes],
-            'median_oos_sharpe':  round(median_oos, 3),
-            'p25_oos_sharpe':     round(p25_oos, 3),
-            'p75_oos_sharpe':     round(float(np.percentile(arr, 75)), 3),
-            'consistency_pct':    round(consistency, 1),
-            'n_paths':            len(oos_sharpes),
-            'is_robust':          is_robust,
+            'oos_sharpes':       [round(s, 3) for s in oos_sharpes],
+            'is_sharpes':        [round(s, 3) for s in is_sharpes],
+            'median_oos_sharpe': round(float(np.median(arr)), 3),
+            'p25_oos_sharpe':    round(p25_oos, 3),
+            'p75_oos_sharpe':    round(float(np.percentile(arr, 75)), 3),
+            'consistency_pct':   round(consistency, 1),
+            'n_paths':           len(oos_sharpes),
+            'is_robust':         (p25_oos > 0) and (consistency >= 60.0),
         }
-
-        logger.info("=" * 55)
-        logger.info("  CPCV RESULTS (%d paths)", result['n_paths'])
-        logger.info("  Median OOS Sharpe : %.3f", result['median_oos_sharpe'])
-        logger.info("  P25 OOS Sharpe    : %.3f  (pessimistic)", result['p25_oos_sharpe'])
-        logger.info("  P75 OOS Sharpe    : %.3f  (optimistic)", result['p75_oos_sharpe'])
-        logger.info("  Consistency       : %.1f%% paths profitable", result['consistency_pct'])
-        logger.info("  Robust            : %s", result['is_robust'])
-
-        if not is_robust:
-            logger.warning(
-                "CPCV: strategy is NOT robust — performance varies widely across "
-                "paths. Consider widening param ranges or reducing complexity."
-            )
-        logger.info("=" * 55)
-
+        self._log_cpcv_result(result)
         return result
 
     # ------------------------------------------------------------------
@@ -419,13 +418,10 @@ class WalkForwardOptimizer:
             self._persist_params(self.best_params)
 
     def _persist_params(self, params: dict):
-        """
-        Write optimized params to .env.optimized so they are reloaded
-        automatically when the bot restarts (config.py reads this file).
-        """
+        """Write optimized params to .env.optimized for automatic reload on restart."""
         lines = [
             "# Auto-generated by WalkForwardOptimizer — do not edit manually",
-            f"# Generated: {datetime.now().isoformat()}",
+            f"# Generated: {_utcnow().isoformat()}",
             "",
         ]
         for k, v in params.items():
@@ -439,10 +435,67 @@ class WalkForwardOptimizer:
     def _reset_defaults(self):
         Config.FAST_EMA = 9
         Config.SLOW_EMA = 21
-        Config.RSI_BUY_MIN = 45
-        Config.RSI_BUY_MAX = 65
-        Config.ATR_MULTIPLIER_TP = 4.0
+        Config.ATR_MULTIPLIER_SL = 2.0
+        Config.ATR_MULTIPLIER_TP = 5.0   # must match MIN_RISK_REWARD=2.5 (5/2=2.5R)
+        Config.MACRO_CONVICTION_THRESHOLD = 0.40
         logger.info("Reset to default parameters (overfit detected)")
+
+    # ------------------------------------------------------------------
+    # Monte Carlo bootstrap: Sharpe confidence interval
+    #
+    # Resamples the trade P&L series 1000× with replacement and computes
+    # the Sharpe distribution. Gives a 90% CI — if the lower bound is
+    # still positive, the edge is statistically robust.
+    # ------------------------------------------------------------------
+    def monte_carlo_sharpe_ci(self, trade_pnls: list,
+                               n_iter: int = 1000,
+                               n_per_year: int = 600) -> dict:
+        """
+        Bootstrap Sharpe confidence interval from a list of trade P&Ls.
+
+        Returns:
+          mean_sharpe   : mean of bootstrap distribution
+          sharpe_p5     : 5th percentile (pessimistic — use for go/no-go decision)
+          sharpe_p50    : median
+          sharpe_p95    : 95th percentile (optimistic)
+          positive_pct  : % of bootstrap samples with Sharpe > 0
+        """
+        if len(trade_pnls) < 10:
+            logger.warning("Monte Carlo: need ≥ 10 trades for CI")
+            return {}
+
+        arr = np.array(trade_pnls, dtype=float)
+        rng = np.random.default_rng(seed=42)
+        sharpes = []
+
+        for _ in range(n_iter):
+            sample = rng.choice(arr, size=len(arr), replace=True)
+            std = sample.std()
+            if std == 0:
+                continue
+            sharpes.append(float(sample.mean() / std * np.sqrt(n_per_year)))
+
+        if not sharpes:
+            return {}
+
+        sharpes = np.array(sharpes)
+        result = {
+            'mean_sharpe':  round(float(sharpes.mean()), 3),
+            'sharpe_p5':    round(float(np.percentile(sharpes, 5)), 3),
+            'sharpe_p50':   round(float(np.percentile(sharpes, 50)), 3),
+            'sharpe_p95':   round(float(np.percentile(sharpes, 95)), 3),
+            'positive_pct': round(float((sharpes > 0).mean() * 100), 1),
+            'n_trades':     len(trade_pnls),
+            'n_iter':       n_iter,
+        }
+        logger.info(
+            "Monte Carlo Sharpe CI (%d trades, %d iter): "
+            "p5=%.3f | median=%.3f | p95=%.3f | %.1f%% positive",
+            result['n_trades'], n_iter,
+            result['sharpe_p5'], result['sharpe_p50'],
+            result['sharpe_p95'], result['positive_pct']
+        )
+        return result
 
 
 if __name__ == "__main__":

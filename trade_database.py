@@ -10,6 +10,7 @@ Includes:
 
 import sqlite3
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 
@@ -23,16 +24,21 @@ class TradeDatabase:
         self.db_path = db_path
         self._init_db()
 
+    @contextmanager
     def _conn(self):
+        """Open, configure, yield, then guarantee close regardless of outcome."""
         conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA synchronous=NORMAL')
         conn.execute('PRAGMA cache_size=-8000')
-        return conn
+        try:
+            with conn:          # sqlite3 context manager: commits on exit, rolls back on exception
+                yield conn
+        finally:
+            conn.close()        # sqlite3 ctxmgr never closes — we must do it explicitly
 
     def _init_db(self):
-        conn = self._conn()
-        try:
+        with self._conn() as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,14 +93,28 @@ class TradeDatabase:
             self._add_column_if_missing(conn, 'trades', 'spread_cost', 'REAL DEFAULT 0')
             self._add_column_if_missing(conn, 'trades', 'net_profit', 'REAL')
             self._add_column_if_missing(conn, 'trades', 'close_time', 'TEXT')
-            conn.commit()
-        finally:
-            conn.close()
+
+    # Pre-built literal migration queries — no runtime identifier interpolation.
+    # SQLite does not support ? placeholders for identifiers (only for values),
+    # so we enumerate every known migration as a static string instead.
+    _MIGRATIONS: dict = {
+        ('trades', 'session'):     'ALTER TABLE trades ADD COLUMN session TEXT',
+        ('trades', 'regime'):      'ALTER TABLE trades ADD COLUMN regime TEXT',
+        ('trades', 'confidence'):  'ALTER TABLE trades ADD COLUMN confidence REAL DEFAULT 0',
+        ('trades', 'macro_mult'):  'ALTER TABLE trades ADD COLUMN macro_mult REAL DEFAULT 1.0',
+        ('trades', 'ml_score'):    'ALTER TABLE trades ADD COLUMN ml_score REAL DEFAULT 0',
+        ('trades', 'commission'):  'ALTER TABLE trades ADD COLUMN commission REAL DEFAULT 0',
+        ('trades', 'spread_cost'): 'ALTER TABLE trades ADD COLUMN spread_cost REAL DEFAULT 0',
+        ('trades', 'net_profit'):  'ALTER TABLE trades ADD COLUMN net_profit REAL',
+        ('trades', 'close_time'):  'ALTER TABLE trades ADD COLUMN close_time TEXT',
+    }
 
     def _add_column_if_missing(self, conn, table, column, col_type):
-        # table and col_type are always internal constants, never user input
+        sql = self._MIGRATIONS.get((table, column))
+        if sql is None:
+            raise ValueError(f"No migration defined for {table}.{column}")
         try:
-            conn.execute('ALTER TABLE {} ADD COLUMN {} {}'.format(table, column, col_type))
+            conn.execute(sql)
         except sqlite3.OperationalError:
             pass  # Column already exists
 

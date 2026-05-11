@@ -157,9 +157,9 @@ class TestRiskManager:
         assert len(rm2._trade_profits) == len(rm1._trade_profits)
 
     def test_validate_rr(self, risk_mgr):
-        # MIN_RISK_REWARD = 2.5; risk=2pts, reward must be >= 5pts
-        assert risk_mgr.validate_risk_reward(2000, 1998, 2005) is True   # 2.5R ✓
-        assert risk_mgr.validate_risk_reward(2000, 1998, 2003) is False  # 1.5R < 2.5 min
+        # MIN_RISK_REWARD = 1.5 (daily trading mode); risk=2pts, reward must be >= 3pts
+        assert risk_mgr.validate_risk_reward(2000, 1998, 2003) is True   # 1.5R ✓
+        assert risk_mgr.validate_risk_reward(2000, 1998, 2001) is False  # 0.5R < 1.5 min
 
 
 # ---------------------------------------------------------------------------
@@ -322,14 +322,15 @@ class TestAdvancedStrategy:
         regime = strat.detect_market_regime(ohlcv_df)
         assert regime in ('trending', 'ranging', 'neutral')
 
-    def test_neutral_macro_blocks_all_signals(self, ohlcv_df):
-        """Default neutral macro must produce no signals — the primary safety gate."""
+    def test_neutral_macro_penalises_confidence(self, ohlcv_df):
+        """Neutral macro reduces confidence but no longer blocks signals entirely.
+        Strategy now operates in daily-trading mode: macro is a multiplier, not a gate."""
         from advanced_strategy import AdvancedStrategy
         strat = AdvancedStrategy(backtest_mode=True)
-        # _macro_direction defaults to 'neutral', score=0.0 — no signals allowed
-        for i in range(100, len(ohlcv_df)):
-            result = strat.generate_signal(ohlcv_df.iloc[:i + 1].copy())
-            assert result is None, "Neutral macro must never generate a signal"
+        # _macro_direction defaults to 'neutral' — signals are allowed with a small penalty
+        macro_ok, boost = strat._macro_allows('BUY')
+        assert macro_ok is True, "Neutral macro must not hard-block signals in daily mode"
+        assert boost <= 0.0, "Neutral macro should apply a confidence penalty (boost <= 0)"
 
     def test_signal_has_required_keys(self, ohlcv_df):
         """With bullish macro unlocked, signals must contain all required keys."""

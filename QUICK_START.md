@@ -27,10 +27,7 @@ cp config_conservative.py config.py
    - Balance: $100
    - Leverage: 1:100
 
-4. You'll receive email with:
-   - Login: 12345678
-   - Password: YourPass123
-   - Server: HFM-Demo
+4. You'll receive an email with your login details (login number, server name).
 
 ### Configure Bot:
 ```bash
@@ -39,9 +36,9 @@ nano .env
 
 Add your credentials:
 ```
-MT5_LOGIN=12345678
-MT5_PASSWORD=YourPass123
-MT5_SERVER=HFM-Demo
+MT5_LOGIN=<your_login_number>
+MT5_PASSWORD=<your_password>
+MT5_SERVER=<your_server>
 ```
 
 Save: `Ctrl+X`, `Y`, `Enter`

@@ -45,7 +45,7 @@ DASHBOARD_HTML = """
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>XAU/USD Bot Dashboard</title>
-  <meta name="dashboard-token" content="{{ dashboard_token }}">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', sans-serif; }
@@ -197,7 +197,14 @@ function fmt(n, decimals) {
 }
 function colorClass(v) { return parseFloat(v) >= 0 ? 'green' : 'red'; }
 
-var _token = document.querySelector('meta[name="dashboard-token"]').content;
+var _token = null;
+
+function _getToken() {
+  if (!_token) {
+    _token = prompt('Dashboard token (set DASHBOARD_TOKEN env var):') || '';
+  }
+  return _token;
+}
 
 function refresh() {
   fetch('/api/data').then(function(r) { return r.json(); }).then(function(data) {
@@ -315,16 +322,24 @@ function renderAttr(elemId, rows) {
 }
 
 function pauseBot() {
-  fetch('/api/pause', {method: 'POST', headers: {'X-Dashboard-Token': _token}})
+  fetch('/api/pause', {method: 'POST', headers: {'X-Dashboard-Token': _getToken()}})
     .then(function(r) { return r.json(); })
-    .then(function(d) { alert(d.message || d.error); refresh(); });
+    .then(function(d) {
+      if (d.error === 'Unauthorized') { _token = null; }
+      alert(d.message || d.error);
+      refresh();
+    });
 }
 
 function stopBot() {
   if (confirm('Activate kill switch? Bot will stop trading immediately.')) {
-    fetch('/api/kill', {method: 'POST', headers: {'X-Dashboard-Token': _token}})
+    fetch('/api/kill', {method: 'POST', headers: {'X-Dashboard-Token': _getToken()}})
       .then(function(r) { return r.json(); })
-      .then(function(d) { alert(d.message || d.error); refresh(); });
+      .then(function(d) {
+        if (d.error === 'Unauthorized') { _token = null; }
+        alert(d.message || d.error);
+        refresh();
+      });
   }
 }
 
@@ -341,7 +356,7 @@ setInterval(refresh, 30000);
 # -----------------------------------------------------------------------
 @app.route('/')
 def index():
-    return render_template_string(DASHBOARD_HTML, dashboard_token=_DASHBOARD_TOKEN)
+    return render_template_string(DASHBOARD_HTML)
 
 
 @app.route('/api/data')

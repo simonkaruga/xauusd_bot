@@ -1,94 +1,99 @@
+"""
+Volume Delta Analysis
+======================
+Approximates order-flow pressure from OHLCV bars using the close-position
+method: a bar closing near its high indicates dominant buying; near its low
+indicates dominant selling. This is significantly more accurate than the
+binary close>open split because it captures partial pressure (e.g., a bullish
+bar that closes mid-range has lower net buy pressure than one that closes at
+the high).
+
+Formula per bar:
+  close_pos  = (close - low) / (high - low + ε)   # 0=closed at low, 1=at high
+  buy_volume  = tick_volume × close_pos
+  sell_volume = tick_volume × (1 − close_pos)
+  delta       = buy_volume − sell_volume
+
+Cumulative delta divergence from price = early reversal warning.
+"""
+
+import numpy as np
 import pandas as pd
 from logger import logger
 
+
 class DeltaAnalysis:
     def __init__(self):
-        self.delta_threshold = 0.6  # 60% buy pressure minimum
-    
-    def calculate_delta(self, df):
-        """Calculate cumulative volume delta (buy vs sell pressure)"""
+        self.delta_threshold = 0.60   # 60% buy pressure required to confirm BUY
+
+    def calculate_delta(self, df: pd.DataFrame) -> pd.DataFrame | None:
         if len(df) < 10:
             return None
-        
-        # Approximate buy/sell volume based on close vs open
-        df['buy_volume'] = df.apply(
-            lambda row: row.get('tick_volume', 1) if row['close'] > row['open'] else 0, 
-            axis=1
-        )
-        df['sell_volume'] = df.apply(
-            lambda row: row.get('tick_volume', 1) if row['close'] < row['open'] else 0, 
-            axis=1
-        )
-        
-        # Calculate delta
-        df['delta'] = df['buy_volume'] - df['sell_volume']
+        df = df.copy()
+
+        bar_range = (df['high'] - df['low']).clip(lower=1e-9)
+        close_pos = (df['close'] - df['low']) / bar_range   # [0, 1]
+
+        df['buy_volume']  = df['tick_volume'] * close_pos
+        df['sell_volume'] = df['tick_volume'] * (1.0 - close_pos)
+        df['delta']            = df['buy_volume'] - df['sell_volume']
         df['cumulative_delta'] = df['delta'].cumsum()
-        
+
+        # 5-bar smoothed delta momentum (positive = rising buy pressure)
+        df['delta_momentum'] = df['delta'].rolling(5, min_periods=1).mean()
+
         return df
-    
-    def get_pressure(self, df, lookback=10):
-        """Get current buying/selling pressure"""
-        if len(df) < lookback:
+
+    def get_pressure(self, df: pd.DataFrame, lookback: int = 10) -> dict | None:
+        if df is None or len(df) < lookback:
             return None
-        
+        if 'buy_volume' not in df.columns:
+            return None
+
         recent = df.tail(lookback)
-        total_buy = recent['buy_volume'].sum()
-        total_sell = recent['sell_volume'].sum()
-        total_volume = total_buy + total_sell
-        
-        if total_volume == 0:
+        total_buy  = float(recent['buy_volume'].sum())
+        total_sell = float(recent['sell_volume'].sum())
+        total_vol  = total_buy + total_sell
+        if total_vol == 0:
             return None
-        
-        buy_pressure = total_buy / total_volume
-        
+
+        buy_pressure = total_buy / total_vol
+        delta_mom = float(recent['delta_momentum'].iloc[-1]) if 'delta_momentum' in recent.columns else 0.0
+
         return {
-            'buy_pressure': buy_pressure,
-            'sell_pressure': 1 - buy_pressure,
-            'is_bullish': buy_pressure > self.delta_threshold,
-            'is_bearish': buy_pressure < (1 - self.delta_threshold),
-            'cumulative_delta': recent['cumulative_delta'].iloc[-1]
+            'buy_pressure':      round(buy_pressure, 3),
+            'sell_pressure':     round(1.0 - buy_pressure, 3),
+            'is_bullish':        buy_pressure > self.delta_threshold,
+            'is_bearish':        buy_pressure < (1.0 - self.delta_threshold),
+            'delta_momentum':    round(delta_mom, 2),
+            'cumulative_delta':  round(float(recent['cumulative_delta'].iloc[-1]), 2),
         }
-    
-    def confirm_signal(self, signal_type, pressure):
-        """Confirm if signal aligns with volume pressure"""
+
+    def confirm_signal(self, signal_type: str, pressure: dict | None) -> bool:
         if pressure is None:
-            return True  # No data, allow signal
-        
+            return True
         if signal_type == 'BUY':
             if pressure['is_bullish']:
-                logger.info(f"✅ BUY confirmed by delta - Buy pressure: {pressure['buy_pressure']*100:.1f}%")
+                logger.info(f"Delta confirms BUY: buy pressure {pressure['buy_pressure']*100:.1f}% | mom={pressure['delta_momentum']:+.1f}")
                 return True
-            else:
-                logger.warning(f"⚠️ BUY rejected by delta - Buy pressure only: {pressure['buy_pressure']*100:.1f}%")
-                return False
-        
-        elif signal_type == 'SELL':
+            logger.info(f"Delta BLOCKED BUY: buy pressure only {pressure['buy_pressure']*100:.1f}%")
+            return False
+        else:
             if pressure['is_bearish']:
-                logger.info(f"✅ SELL confirmed by delta - Sell pressure: {pressure['sell_pressure']*100:.1f}%")
+                logger.info(f"Delta confirms SELL: sell pressure {pressure['sell_pressure']*100:.1f}% | mom={pressure['delta_momentum']:+.1f}")
                 return True
-            else:
-                logger.warning(f"⚠️ SELL rejected by delta - Sell pressure only: {pressure['sell_pressure']*100:.1f}%")
-                return False
-        
-        return True
-    
-    def get_divergence(self, df, price_col='close'):
-        """Detect price-delta divergence (early reversal signal)"""
-        if len(df) < 20:
+            logger.info(f"Delta BLOCKED SELL: sell pressure only {pressure['sell_pressure']*100:.1f}%")
+            return False
+
+    def get_divergence(self, df: pd.DataFrame, price_col: str = 'close') -> str | None:
+        """Bullish/bearish divergence: price trend opposes cumulative delta trend."""
+        if df is None or len(df) < 20 or 'cumulative_delta' not in df.columns:
             return None
-        
         recent = df.tail(20)
-        
-        # Price trend
-        price_trend = recent[price_col].iloc[-1] > recent[price_col].iloc[0]
-        
-        # Delta trend
-        delta_trend = recent['cumulative_delta'].iloc[-1] > recent['cumulative_delta'].iloc[0]
-        
-        # Divergence detection
-        if price_trend and not delta_trend:
-            return 'bearish_divergence'  # Price up, delta down = weakness
-        elif not price_trend and delta_trend:
-            return 'bullish_divergence'  # Price down, delta up = strength
-        
+        price_up = float(recent[price_col].iloc[-1]) > float(recent[price_col].iloc[0])
+        delta_up = float(recent['cumulative_delta'].iloc[-1]) > float(recent['cumulative_delta'].iloc[0])
+        if price_up and not delta_up:
+            return 'bearish_divergence'
+        if not price_up and delta_up:
+            return 'bullish_divergence'
         return None

@@ -40,6 +40,8 @@ class RiskManager:
         self.losing_streak = 0
         self._trade_profits = []
         self._open_risk = {}
+        self._regime_profits: dict = {}   # regime → [profits]
+        self._last_regime: str = 'trending'
         self._load_state()
 
     # ------------------------------------------------------------------
@@ -179,8 +181,9 @@ class RiskManager:
         # --- Step 1: base risk ---
         base_risk_pct = Config.RISK_PER_TRADE
 
-        # --- Step 2: Kelly adjustment ---
-        kelly_risk = self._kelly_risk()
+        # --- Step 2: Regime-conditional Kelly adjustment ---
+        self._last_regime = market_regime
+        kelly_risk = self._kelly_risk_by_regime(market_regime)
         if kelly_risk > 0:
             # Blend 50% fixed / 50% Kelly
             base_risk_pct = 0.5 * Config.RISK_PER_TRADE + 0.5 * kelly_risk
@@ -271,6 +274,37 @@ class RiskManager:
         fractional_kelly = full_kelly * 0.25   # 25% Kelly = conservative but optimal
         return max(0.005, min(fractional_kelly, 0.03))
 
+    def _kelly_risk_by_regime(self, regime: str) -> float:
+        """
+        Regime-conditional Kelly: compute win rate and avg R separately per
+        market regime (trending / neutral / ranging). Edge differs significantly
+        across regimes — trending markets favour momentum, ranging markets
+        favour mean-reversion. Using a single pool blends them and underestimates
+        sizing in the best regime while over-sizing in the worst.
+        Falls back to the global Kelly if fewer than 8 trades in this regime.
+        """
+        regime_trades = self._regime_profits.get(regime, [])
+        if len(regime_trades) < 8:
+            return self._kelly_risk()   # not enough regime-specific data
+
+        wins   = [p for p in regime_trades if p > 0]
+        losses = [p for p in regime_trades if p <= 0]
+        if not wins or not losses:
+            return self._kelly_risk()
+
+        win_rate = len(wins) / len(regime_trades)
+        avg_win  = np.mean(wins)
+        avg_loss = abs(np.mean(losses))
+        if avg_loss == 0:
+            return self._kelly_risk()
+
+        r = avg_win / avg_loss
+        full_kelly = win_rate - (1 - win_rate) / r
+        if full_kelly <= 0:
+            return Config.RISK_PER_TRADE * 0.5
+
+        return max(0.005, min(full_kelly * 0.25, 0.03))
+
     # ------------------------------------------------------------------
     # R:R validation
     # ------------------------------------------------------------------
@@ -298,10 +332,19 @@ class RiskManager:
         self._open_risk[ticket] = risk_amount
         logger.info(f"Portfolio heat: ${sum(self._open_risk.values()):.2f} total open risk")
 
-    def deregister_trade(self, ticket: int, profit: float = None):
+    def deregister_trade(self, ticket: int, profit: float = None,
+                         regime: str = None):
         self._open_risk.pop(ticket, None)
         if profit is not None:
             self._trade_profits.append(profit)
+            # Record profit in per-regime bucket for regime-conditional Kelly
+            r = regime or self._last_regime
+            if r not in self._regime_profits:
+                self._regime_profits[r] = []
+            self._regime_profits[r].append(profit)
+            # Keep regime buckets bounded (last 100 trades per regime)
+            if len(self._regime_profits[r]) > 100:
+                self._regime_profits[r] = self._regime_profits[r][-100:]
             if profit > 0:
                 self.winning_streak += 1
                 self.losing_streak = 0
@@ -309,7 +352,11 @@ class RiskManager:
                 self.losing_streak += 1
                 self.winning_streak = 0
             self._save_state()
-            logger.info(f"Trade closed: ${profit:.2f} | Streaks W{self.winning_streak}/L{self.losing_streak}")
+            logger.info(
+                f"Trade closed: ${profit:.2f} | Regime: {r} | "
+                f"Regime trades: {len(self._regime_profits[r])} | "
+                f"Streaks W{self.winning_streak}/L{self.losing_streak}"
+            )
 
     # ------------------------------------------------------------------
     # Trade tracking

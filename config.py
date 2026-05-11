@@ -12,11 +12,12 @@ load_dotenv()
 # RSI_BUY_MIN/MAX and RSI_SELL_MIN/MAX were removed because the active
 # strategy uses hardcoded RSI ranges in _pullback_confirmed(), not Config values.
 _OPTIMIZABLE = {
-    'FAST_EMA':            int,
-    'SLOW_EMA':            int,
-    'ATR_MULTIPLIER_SL':   float,
-    'ATR_MULTIPLIER_TP':   float,
-    'ATR_MULTIPLIER_TP1':  float,
+    'FAST_EMA':                   int,
+    'SLOW_EMA':                   int,
+    'ATR_MULTIPLIER_SL':          float,
+    'ATR_MULTIPLIER_TP':          float,
+    'ATR_MULTIPLIER_TP1':         float,
+    'MACRO_CONVICTION_THRESHOLD': float,
 }
 
 
@@ -74,7 +75,7 @@ class Config:
     RISK_PER_TRADE = 0.01        # 1% of $1,000 = $10 per trade
     MAX_DAILY_LOSS = 0.03        # 3% of $1,000 = $30 max daily loss
     MAX_OPEN_TRADES = 1          # 1 trade at a time
-    MIN_RISK_REWARD = 2.5        # 1:2.5 R:R minimum (raised from 2.0)
+    MIN_RISK_REWARD = 1.5        # 1:1.5 R:R minimum — achievable daily target
 
     # Strategy Parameters
     FAST_EMA = 9
@@ -82,7 +83,7 @@ class Config:
     RSI_PERIOD = 14
     ATR_PERIOD = 14
     ATR_MULTIPLIER_SL = 2.0
-    ATR_MULTIPLIER_TP = 5.0      # 5R target on 2R stop = 2.5 R:R (matches MIN_RISK_REWARD)
+    ATR_MULTIPLIER_TP = 3.0      # 3R target on 2R stop = 1.5 R:R (matches MIN_RISK_REWARD)
 
     # RSI Filters
     RSI_BUY_MIN = 45
@@ -90,9 +91,11 @@ class Config:
     RSI_SELL_MIN = 35
     RSI_SELL_MAX = 55
 
-    # Trading Session (GMT) - London/NY Overlap ONLY (Best hours)
-    TRADING_START_HOUR = 12      # 12 PM GMT = 3 PM Nairobi = 2 PM SA
-    TRADING_END_HOUR = 16        # 4 PM GMT  = 7 PM Nairobi = 6 PM SA
+    # Trading Session (GMT) — London open through NY close
+    # 08:00 GMT catches the Asian range breakout at London open
+    # 20:00 GMT covers the full NY session for PDH/PDL reactions
+    TRADING_START_HOUR = 8       # 8 AM GMT = 11 AM Nairobi = 10 AM SA
+    TRADING_END_HOUR = 20        # 8 PM GMT = 11 PM Nairobi = 10 PM SA
 
     # Best trading days (Mon-Thu only, avoid Friday)
     TRADING_DAYS = 'mon-thu'     # Skip Friday (NFP risk, position squaring)
@@ -130,7 +133,7 @@ class Config:
     TRAILING_DISTANCE = 1.0
 
     # Safety Limits
-    MAX_TRADES_PER_DAY = 3
+    MAX_TRADES_PER_DAY = 2       # 2 quality trades per day (London open + NY session)
     MIN_TIME_BETWEEN_TRADES = 60
 
     # Volume Analysis
@@ -170,6 +173,15 @@ class Config:
 
     # Hard ceiling on risk per trade (safety net above Kelly)
     MAX_RISK_PER_TRADE = 0.02
+
+    # Macro gate conviction threshold (optimizable)
+    MACRO_CONVICTION_THRESHOLD = 0.40
+
+    # ML ensemble minimum win-probability to allow a trade
+    ML_PREDICTION_THRESHOLD = 0.55
+
+    # Typical ECN spread for XAUUSD (used in position sizing to account for real entry cost)
+    SPREAD_POINTS = 0.35
 
 
 # Apply any walk-forward optimized overrides saved in .env.optimized

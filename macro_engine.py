@@ -1,7 +1,7 @@
 """
 Macro Engine
 =============
-Gold's fundamental drivers (four-component composite):
+Gold's fundamental drivers (six-component composite):
 
 1. US 10-Year Real Yield (TIPS) — fetched from FRED (DFII10).
    Real yield rising  → gold falls  (opportunity cost rises)
@@ -20,6 +20,17 @@ Gold's fundamental drivers (four-component composite):
    Inverted curve (negative spread) → recession risk → bullish gold
    Steepening curve → growth/risk-on → bearish gold
    Weight: ±0.15
+
+5. VIX (CBOE S&P 500 Volatility Index, FRED VIXCLS).
+   VIX > 30 → strong risk-off → safe-haven gold demand → +0.10
+   VIX > 20 → mild risk-off → mildly bullish           → +0.05
+   VIX < 15 → risk-on / complacency → gold headwind    → -0.05
+
+6. GVZ (CBOE Gold Volatility Index, FRED GVZCLS).
+   Not a directional component — used as a position-size regime multiplier.
+   GVZ > 25 → chaotic gold vol  → gvz_size_mult = 0.75 (reduce size)
+   GVZ 15-25 → normal           → gvz_size_mult = 1.00
+   GVZ < 15  → calm / trending  → gvz_size_mult = 1.10 (trend-following sweet spot)
 
 Combined macro score: -1.0 (strong bearish for gold) to +1.0 (strong bullish).
 
@@ -70,6 +81,11 @@ class MacroEngine:
           dxy_trend         : 'rising' | 'falling' | 'flat'
           yield_curve_spread: 10Y-2Y spread in % (negative = inverted)
           cot_score         : -1 to +1 commercial positioning
+          vix               : latest VIX level
+          vix_score         : VIX contribution to composite (±0.10)
+          gvz               : latest GVZ level (Gold VIX)
+          gvz_regime        : 'high' | 'normal' | 'low'
+          gvz_size_mult     : position-size multiplier from GVZ (0.75-1.10)
           allow_buy         : bool
           allow_sell        : bool
         """
@@ -85,9 +101,10 @@ class MacroEngine:
         real_yield, yield_trend = self._get_real_yield()
         dxy_trend, dxy_strength = self._get_dxy_trend()
         curve_spread, curve_score = self._get_yield_curve()
+        vix, vix_score = self._get_vix()
+        gvz, gvz_regime, gvz_size_mult = self._get_gvz()
 
         # --- Score components ---
-        # Real yield: falling = bullish for gold (+), rising = bearish (-)
         if yield_trend == 'falling':
             yield_score = 0.4
         elif yield_trend == 'rising':
@@ -95,7 +112,6 @@ class MacroEngine:
         else:
             yield_score = 0.0
 
-        # DXY: falling = bullish for gold (+), rising = bearish (-)
         if dxy_trend == 'falling':
             dxy_score = 0.3 * dxy_strength
         elif dxy_trend == 'rising':
@@ -103,14 +119,10 @@ class MacroEngine:
         else:
             dxy_score = 0.0
 
-        # COT: already -1 to +1, weight at 0.3
         cot_score = 0.3 * self._cot_score
 
-        # Yield curve: inverted (negative) = recession risk = bullish gold
-        # curve_score already scaled ±0.15 by _get_yield_curve()
-
-        # Composite
-        raw_score = yield_score + dxy_score + cot_score + curve_score
+        # Composite (clamped to ±1.0)
+        raw_score = yield_score + dxy_score + cot_score + curve_score + vix_score
         score = max(-1.0, min(1.0, raw_score))
 
         if score >= 0.25:
@@ -130,6 +142,11 @@ class MacroEngine:
             'yield_curve_spread': round(curve_spread, 3),
             'yield_curve_score': round(curve_score, 3),
             'cot_score': round(self._cot_score, 3),
+            'vix': round(vix, 2),
+            'vix_score': round(vix_score, 3),
+            'gvz': round(gvz, 2),
+            'gvz_regime': gvz_regime,
+            'gvz_size_mult': round(gvz_size_mult, 2),
             'allow_buy': direction in ('bullish', 'neutral'),
             'allow_sell': direction in ('bearish', 'neutral'),
             'timestamp': _utcnow().isoformat(),
@@ -140,7 +157,9 @@ class MacroEngine:
             f"Macro Engine: score={score:+.3f} direction={direction} | "
             f"yield={real_yield:.2f}% ({yield_trend}) | "
             f"DXY={dxy_trend} ({dxy_strength:.2f}) | "
-            f"curve={curve_spread:+.2f}% (score={curve_score:+.3f}) | "
+            f"curve={curve_spread:+.2f}% | "
+            f"VIX={vix:.1f} (score={vix_score:+.3f}) | "
+            f"GVZ={gvz:.1f} ({gvz_regime} ×{gvz_size_mult:.2f}) | "
             f"COT={self._cot_score:+.3f}"
         )
         return result
@@ -152,28 +171,36 @@ class MacroEngine:
         """
         Returns (allowed: bool, size_multiplier: float, reason: str).
         Hard-blocks signals that go against strong macro conviction.
+        GVZ size multiplier is applied on top of the directional multiplier.
         """
         macro = self.get_macro_score()
         score = macro['score']
         direction = macro['direction']
+        gvz_mult = macro.get('gvz_size_mult', 1.0)
 
         if signal_type == 'BUY':
             if direction == 'bearish':
                 return False, 0.0, f"Macro BEARISH (score={score:+.3f}) — blocking BUY"
             elif direction == 'bullish':
-                mult = min(1.3, 1.0 + abs(score) * 0.5)
-                return True, mult, f"Macro BULLISH (score={score:+.3f}) — boosting BUY x{mult:.2f}"
+                base_mult = min(1.3, 1.0 + abs(score) * 0.5)
+                mult = round(base_mult * gvz_mult, 3)
+                return True, mult, (f"Macro BULLISH (score={score:+.3f}) "
+                                    f"GVZ={macro.get('gvz_regime','?')} — BUY x{mult:.2f}")
             else:
-                return True, 0.85, f"Macro NEUTRAL (score={score:+.3f}) — reduced BUY size"
+                mult = round(0.85 * gvz_mult, 3)
+                return True, mult, f"Macro NEUTRAL (score={score:+.3f}) — reduced BUY x{mult:.2f}"
 
         else:  # SELL
             if direction == 'bullish':
                 return False, 0.0, f"Macro BULLISH (score={score:+.3f}) — blocking SELL"
             elif direction == 'bearish':
-                mult = min(1.3, 1.0 + abs(score) * 0.5)
-                return True, mult, f"Macro BEARISH (score={score:+.3f}) — boosting SELL x{mult:.2f}"
+                base_mult = min(1.3, 1.0 + abs(score) * 0.5)
+                mult = round(base_mult * gvz_mult, 3)
+                return True, mult, (f"Macro BEARISH (score={score:+.3f}) "
+                                    f"GVZ={macro.get('gvz_regime','?')} — SELL x{mult:.2f}")
             else:
-                return True, 0.85, f"Macro NEUTRAL (score={score:+.3f}) — reduced SELL size"
+                mult = round(0.85 * gvz_mult, 3)
+                return True, mult, f"Macro NEUTRAL (score={score:+.3f}) — reduced SELL x{mult:.2f}"
 
     # ------------------------------------------------------------------
     # 10Y TIPS Real Yield (FRED)
@@ -262,6 +289,66 @@ class MacroEngine:
             return 0.0, 0.0
 
     # ------------------------------------------------------------------
+    # VIX — CBOE S&P 500 Volatility Index (FRED VIXCLS)
+    # ------------------------------------------------------------------
+    def _get_vix(self) -> tuple:
+        """Returns (vix_level, vix_score ±0.10)."""
+        try:
+            url = _FRED_BASE + "VIXCLS"
+            resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+            if resp.status_code != 200:
+                raise ValueError(f"FRED HTTP {resp.status_code}")
+            lines = resp.text.strip().split('\n')
+            rows = [(d, float(v)) for d, v in
+                    (l.split(',') for l in lines[1:] if len(l.split(',')) == 2)
+                    if v.strip() not in ('.', '')]
+            if not rows:
+                raise ValueError("No VIX data")
+            vix = rows[-1][1]
+            if vix > 30:
+                score = +0.10   # strong risk-off → gold safe-haven demand
+            elif vix > 20:
+                score = +0.05   # mild risk-off
+            elif vix < 15:
+                score = -0.05   # risk-on / complacency → gold headwind
+            else:
+                score = 0.0
+            logger.info(f"VIX: {vix:.1f} → score={score:+.3f}")
+            return vix, score
+        except Exception as e:
+            logger.warning(f"VIX fetch failed: {e} — using neutral")
+            return 20.0, 0.0
+
+    # ------------------------------------------------------------------
+    # GVZ — CBOE Gold Volatility Index (FRED GVZCLS)
+    # ------------------------------------------------------------------
+    def _get_gvz(self) -> tuple:
+        """Returns (gvz_level, regime: 'high'|'normal'|'low', size_mult: 0.75-1.10)."""
+        try:
+            url = _FRED_BASE + "GVZCLS"
+            resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+            if resp.status_code != 200:
+                raise ValueError(f"FRED HTTP {resp.status_code}")
+            lines = resp.text.strip().split('\n')
+            rows = [(d, float(v)) for d, v in
+                    (l.split(',') for l in lines[1:] if len(l.split(',')) == 2)
+                    if v.strip() not in ('.', '')]
+            if not rows:
+                raise ValueError("No GVZ data")
+            gvz = rows[-1][1]
+            if gvz > 25:
+                regime, mult = 'high', 0.75    # chaotic vol → smaller size, wider spreads
+            elif gvz < 15:
+                regime, mult = 'low', 1.10     # calm → trend-following sweet spot
+            else:
+                regime, mult = 'normal', 1.00
+            logger.info(f"GVZ (Gold VIX): {gvz:.1f} → {regime} (size ×{mult:.2f})")
+            return gvz, regime, mult
+        except Exception as e:
+            logger.warning(f"GVZ fetch failed: {e} — using neutral")
+            return 20.0, 'normal', 1.00
+
+    # ------------------------------------------------------------------
     # DXY trend via EURUSD from MT5
     # ------------------------------------------------------------------
     def _get_dxy_trend(self) -> tuple:
@@ -324,6 +411,6 @@ class MacroEngine:
             try:
                 with open(_CACHE_PATH) as f:
                     return json.load(f)
-            except (OSError, json.JSONDecodeError):
-            pass
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(f"Macro cache load failed: {e}")
         return {}

@@ -12,7 +12,20 @@ Wires all modules together for a single trading cycle:
 
 import MetaTrader5 as mt5
 import pandas_ta as ta
+from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
+
+class MarketContext(NamedTuple):
+    df_h1: object
+    df_h4: object
+    vwap_price: float
+    anchors: dict
+
+class SignalResult(NamedTuple):
+    signal: dict
+    ml_score: float
+    macro_mult: float
+    macro_reason: str
 from mt5_connector import MT5Connector
 from advanced_strategy import AdvancedStrategy
 from risk_manager import RiskManager
@@ -32,6 +45,9 @@ from dom_analysis import DOMAnalysis
 from vwap_filter import VWAPFilter
 from macro_engine import MacroEngine
 from news_sentiment import NewsSentiment
+from performance_monitor import PerformanceMonitor
+from backtester import Backtester
+from session_anchor import SessionAnchor
 from config import Config
 from logger import logger
 
@@ -72,11 +88,16 @@ class TradingBot:
         self.vwap_filter = VWAPFilter()
         self.macro_engine = MacroEngine(connector=self.connector)
         self.news_sentiment = NewsSentiment()
+        self.perf_monitor = PerformanceMonitor()
+        self.session_anchor = SessionAnchor()
         self.running = False
 
         # Pending limit order tracking: {ticket: {signal, expires_at, size}}
         self._pending_limits: dict = {}
         self._cot_last_refresh = None
+        self._cycle_count = 0
+        self._retrain_in_progress = False   # guard against concurrent retrains
+        self._retrain_last_at = None        # datetime of last auto-retrain
 
     # ------------------------------------------------------------------
     # Startup
@@ -154,8 +175,13 @@ class TradingBot:
         if not self._pre_cycle_checks():
             return
         try:
+            self._cycle_count += 1
             self._maybe_refresh_cot()
             self._manage_pending_limits()
+
+            # Every 10 cycles: adapt ML threshold + trigger retrain if needed
+            if self._cycle_count % 10 == 0:
+                self._adapt_ml_threshold()
 
             if not self.news_filter.is_safe_to_trade() or not self.news_monitor.is_safe_to_trade():
                 return
@@ -167,8 +193,7 @@ class TradingBot:
             if not self.risk_manager.can_trade(len(positions), balance):
                 return
 
-            signal, ml_score, macro_mult, macro_reason = self._evaluate_signal(balance)
-            if signal is None:
+            signal, ml_score, macro_mult, macro_reason = self._evaluate_signal(balance)            if signal is None:
                 return
 
             position_size = self._calculate_size(signal, balance, macro_mult)
@@ -213,15 +238,8 @@ class TradingBot:
         )
         return balance, positions
 
-    def _evaluate_signal(self, balance: float):
-        """Fetch data, run all signal gates. Returns (signal, ml_score, macro_mult, macro_reason) or (None,…)."""
-        _none = (None, None, None, None)
-
-        df = self.connector.get_bars(Config.SYMBOL, Config.TIMEFRAME, 200)
-        if df is None or len(df) < 55:
-            self.health_monitor.record_error("Market data failed")
-            return _none
-
+    def _fetch_market_context(self, df) -> tuple:
+        """Fetch HTF bars, update macro/sentiment context, compute VWAP and session anchors."""
         df_h1 = df_h4 = None
         if Config.USE_MTF_CONFIRMATION:
             df_h1 = self.connector.get_bars(Config.SYMBOL, Config.HIGHER_TIMEFRAME, 100)
@@ -236,35 +254,60 @@ class TradingBot:
 
         vwap_data = self.vwap_filter.compute(df)
         vwap_price = vwap_data.get('vwap') if vwap_data else None
-        signal = self.strategy.generate_signal(df, df_h1, df_h4, vwap=vwap_price)
-        if signal is None:
-            return _none
 
+        self.session_anchor.update(df)
+        anchors = self.session_anchor.get_anchors()
+        return MarketContext(df_h1, df_h4, vwap_price, anchors)
+
+    def _apply_signal_gates(self, signal: dict, df) -> tuple:
+        """Run ML, macro, DOM, VWAP, and R:R gates. Returns (ml_score, macro_mult, macro_reason) or None."""
         ml_score = self.ml_classifier.predict(df, signal['type'])
         if not self.ml_classifier.should_trade(df, signal['type']):
             logger.info(f"ML gate BLOCKED signal (score={ml_score:.3f})")
-            return _none
+            return None
 
         macro_ok, macro_mult, macro_reason = self.correlation_filter.check(signal['type'], df)
         if not macro_ok:
-            return _none
+            return None
 
         dom_ok, dom_mult = self.dom.check_signal(signal['type'], Config.SYMBOL)
         if not dom_ok:
             logger.info(f"DOM gate BLOCKED {signal['type']}")
-            return _none
+            return None
 
         _, vwap_mult = self.vwap_filter.check_signal(signal['type'], df)
-        macro_mult *= dom_mult * vwap_mult * self.news_sentiment.get_size_multiplier(signal['type'])
+        macro_mult *= dom_mult * vwap_mult
 
         if self._near_round_number(signal['price']):
             logger.info(f"ROUND NUMBER GUARD: skipping {signal['type']} @ {signal['price']:.2f}")
-            return _none
+            return None
 
         if not self.risk_manager.validate_risk_reward(signal['price'], signal['sl'], signal['tp']):
+            return None
+
+        return ml_score, macro_mult, macro_reason
+
+    def _evaluate_signal(self, balance: float):
+        """Orchestrate market context + signal generation + quality gates."""
+        _none = SignalResult(None, None, None, None)
+
+        df = self.connector.get_bars(Config.SYMBOL, Config.TIMEFRAME, 200)
+        if df is None or len(df) < 55:
+            self.health_monitor.record_error("Market data failed")
             return _none
 
-        return signal, ml_score, macro_mult, macro_reason
+        ctx = self._fetch_market_context(df)
+        signal = self.strategy.generate_signal(df, ctx.df_h1, ctx.df_h4,
+                                               vwap=ctx.vwap_price, anchors=ctx.anchors)
+        if signal is None:
+            return _none
+
+        gates = self._apply_signal_gates(signal, df)
+        if gates is None:
+            return _none
+
+        ml_score, macro_mult, macro_reason = gates
+        return SignalResult(signal, ml_score, macro_mult, macro_reason)
 
     def _calculate_size(self, signal: dict, balance: float, macro_mult: float) -> float:
         """Compute volatility-adjusted position size."""
@@ -275,12 +318,20 @@ class TradingBot:
             s = ta.atr(df['high'], df['low'], df['close'], length=Config.ATR_PERIOD)
             if s is not None and not s.dropna().empty:
                 avg_atr = float(s.dropna().mean())
-        except Exception:
-            pass
+        except (ConnectionError, ValueError, TypeError, AttributeError) as e:
+            logger.warning(f"ATR fetch for vol sizing failed: {e} — using signal ATR")
         vol_adj = self.volatility_manager.adjust_risk_for_volatility(signal['atr'], avg_atr)
 
+        # Account for spread: actual fill is at ask (BUY) or bid (SELL), not mid.
+        # Half-spread widens the effective distance to SL, so we size accordingly.
+        spread = getattr(Config, 'SPREAD_POINTS', SPREAD_POINTS)
+        if signal['type'] == 'BUY':
+            effective_entry = signal['price'] + spread / 2
+        else:
+            effective_entry = signal['price'] - spread / 2
+
         size = self.risk_manager.calculate_position_size(
-            balance, signal['price'], signal['sl'],
+            balance, effective_entry, signal['sl'],
             symbol_info=symbol_info,
             signal_confidence=signal.get('confidence', 0.7),
             macro_multiplier=macro_mult,
@@ -322,10 +373,25 @@ class TradingBot:
 
     def _try_limit_order(self, signal, position_size, tick, session,
                           ml_score, macro_mult, macro_reason, offset, expiry_seconds):
+        entry_zone = signal.get('entry_zone')
         if signal['type'] == 'BUY':
-            limit_price, limit_type, intended_price = tick.ask - offset, mt5.ORDER_TYPE_BUY_LIMIT, tick.ask
+            intended_price = tick.ask
+            limit_type = mt5.ORDER_TYPE_BUY_LIMIT
+            if entry_zone:
+                # Place at FVG/OB midpoint — better R:R than a fixed ATR offset
+                candidate = entry_zone['midpoint']
+                # Must be strictly below current ask (limit order requirement)
+                limit_price = min(candidate, tick.ask - 0.10)
+            else:
+                limit_price = tick.ask - offset
         else:
-            limit_price, limit_type, intended_price = tick.bid + offset, mt5.ORDER_TYPE_SELL_LIMIT, tick.bid
+            intended_price = tick.bid
+            limit_type = mt5.ORDER_TYPE_SELL_LIMIT
+            if entry_zone:
+                candidate = entry_zone['midpoint']
+                limit_price = max(candidate, tick.bid + 0.10)
+            else:
+                limit_price = tick.bid + offset
 
         ticket = self.connector.place_limit_order(
             Config.SYMBOL, limit_type, position_size,
@@ -477,6 +543,96 @@ class TradingBot:
         """Return True if price is within ROUND_NUMBER_BUFFER of a $50 level."""
         nearest_50 = round(price / 50) * 50
         return abs(price - nearest_50) <= self.ROUND_NUMBER_BUFFER
+
+    # ------------------------------------------------------------------
+    # Adaptive ML threshold + auto-retrain pipeline
+    # ------------------------------------------------------------------
+    def _adapt_ml_threshold(self):
+        """
+        Every 10 cycles:
+          1. Ask PerformanceMonitor for live degradation severity.
+          2. Adjust Config.ML_PREDICTION_THRESHOLD accordingly.
+          3. If severe degradation AND PSI drift is critical, trigger auto-retrain.
+        """
+        base = getattr(Config, 'ML_PREDICTION_THRESHOLD', 0.55)
+        new_threshold = self.perf_monitor.get_adaptive_threshold(base)
+
+        if new_threshold != base:
+            logger.info(
+                f"Adaptive ML threshold: {base:.3f} → {new_threshold:.3f} "
+                f"(live performance adjustment)"
+            )
+            Config.ML_PREDICTION_THRESHOLD = new_threshold
+
+        # Check PSI drift; auto-retrain if critical + severe performance
+        status = self.perf_monitor.get_degradation_status()
+        if status['severity'] == 'severe' and not self._retrain_in_progress:
+            drift = self.ml_classifier.check_feature_drift()
+            if drift.get('needs_retrain'):
+                logger.warning(
+                    "Auto-retrain triggered: severe performance degradation + critical feature drift"
+                )
+                self.notifier.send_message(
+                    "ML auto-retrain triggered: live performance degrading + feature drift critical"
+                )
+                self._auto_retrain_ml()
+
+    def _auto_retrain_ml(self):
+        """
+        Fetch recent M15 bars, run a quick backtest to get trade labels,
+        retrain both GBM and RF ensemble, reset threshold to base.
+        Uses a guard flag to prevent concurrent retrains.
+        """
+        if self._retrain_in_progress:
+            return
+
+        # Throttle: no more than one retrain per 24 hours
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if self._retrain_last_at is not None:
+            hours_since = (now - self._retrain_last_at).total_seconds() / 3600
+            if hours_since < 24:
+                logger.info(f"Skipping retrain — last one {hours_since:.1f}h ago (min 24h)")
+                return
+
+        self._retrain_in_progress = True
+        try:
+            df = self.connector.get_bars(Config.SYMBOL, Config.TIMEFRAME, 5000)
+            if df is None or len(df) < 200:
+                logger.warning("Auto-retrain: insufficient bars, skipping")
+                return
+
+            import pandas as pd
+            df['time'] = pd.to_datetime(df['time'])
+
+            bt = Backtester()
+            result = bt.run_on_df(df, initial_balance=Config.SIMULATED_BALANCE)
+            if not result or 'error' in result or len(bt.trades) < 30:
+                logger.warning(
+                    f"Auto-retrain: backtest produced {len(bt.trades)} trades — need 30+, skipping"
+                )
+                return
+
+            trade_list = [
+                {'entry_bar': t['entry_bar'], 'profit': t['profit']}
+                for t in bt.trades if 'entry_bar' in t
+            ]
+            success = self.ml_classifier.train(df, trade_list)
+            if success:
+                Config.ML_PREDICTION_THRESHOLD = getattr(Config, 'ML_PREDICTION_THRESHOLD', 0.55)
+                self._retrain_last_at = now
+                logger.info(
+                    f"Auto-retrain complete: {len(trade_list)} trades | "
+                    f"WR={result['win_rate']}% | threshold reset to {Config.ML_PREDICTION_THRESHOLD:.3f}"
+                )
+                self.notifier.send_message(
+                    f"ML retrain done: {len(trade_list)} trades | WR={result['win_rate']}%"
+                )
+            else:
+                logger.warning("Auto-retrain: ml_classifier.train() returned False")
+        except Exception as e:
+            logger.error(f"Auto-retrain failed: {e}", exc_info=True)
+        finally:
+            self._retrain_in_progress = False
 
     # ------------------------------------------------------------------
     # Weekly COT refresh

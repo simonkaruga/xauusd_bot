@@ -84,36 +84,81 @@ class PerformanceMonitor:
     # Degradation detection
     # ------------------------------------------------------------------
     def check_performance_degradation(self) -> str | None:
-        trades = self.db.get_all_trades(limit=20)
-        closed = [t for t in trades if t[14] == 'CLOSED']
-        if len(closed) < 20:
-            return None
-
-        profits = [t[13] or t[10] or 0 for t in closed]
-        recent_10 = profits[:10]
-        prior_10 = profits[10:20]
-
-        recent_wr = sum(1 for p in recent_10 if p > 0) / 10
-        prior_wr = sum(1 for p in prior_10 if p > 0) / 10
-
-        recent_sharpe = self._sharpe(recent_10)
-        prior_sharpe = self._sharpe(prior_10)
-
-        alert = None
-        if recent_wr < prior_wr - 0.15:
-            alert = (
-                f"WIN RATE DEGRADATION: recent {recent_wr*100:.0f}% vs prior {prior_wr*100:.0f}%"
-            )
-        elif prior_sharpe > 0.5 and recent_sharpe < prior_sharpe * 0.5:
-            alert = (
-                f"SHARPE DEGRADATION: recent {recent_sharpe:.2f} vs prior {prior_sharpe:.2f}"
-            )
-
+        result = self.get_degradation_status()
+        alert = result.get('alert')
         if alert:
             logger.warning(f"Performance alert: {alert}")
             self.alerts.append({'time': _utcnow().isoformat(), 'msg': alert})
-
         return alert
+
+    def get_degradation_status(self) -> dict:
+        """
+        Returns structured degradation info:
+          severity: None | 'mild' | 'severe'
+          alert: human-readable string or None
+          recent_wr, prior_wr, recent_sharpe, prior_sharpe
+        Used by trading_bot to adapt Config.ML_PREDICTION_THRESHOLD.
+        """
+        trades = self.db.get_all_trades(limit=40)
+        closed = [t for t in trades if t[14] == 'CLOSED']
+        if len(closed) < 20:
+            return {'severity': None, 'alert': None}
+
+        profits = [t[13] or t[10] or 0 for t in closed]
+        recent = profits[:10]
+        prior  = profits[10:20]
+
+        recent_wr    = sum(1 for p in recent if p > 0) / len(recent)
+        prior_wr     = sum(1 for p in prior  if p > 0) / len(prior)
+        recent_sharpe = self._sharpe(recent)
+        prior_sharpe  = self._sharpe(prior)
+
+        wr_drop = prior_wr - recent_wr
+        sharpe_collapsed = (prior_sharpe > 0.5 and
+                            recent_sharpe < prior_sharpe * 0.5)
+
+        if wr_drop >= 0.20 or sharpe_collapsed:
+            severity = 'severe'
+            alert = (f"SEVERE DEGRADATION: WR {recent_wr*100:.0f}% vs prior {prior_wr*100:.0f}% "
+                     f"| Sharpe {recent_sharpe:.2f} vs {prior_sharpe:.2f}")
+        elif wr_drop >= 0.10:
+            severity = 'mild'
+            alert = f"MILD DEGRADATION: WR {recent_wr*100:.0f}% vs prior {prior_wr*100:.0f}%"
+        else:
+            severity = None
+            alert = None
+
+        return {
+            'severity': severity,
+            'alert': alert,
+            'recent_wr': recent_wr,
+            'prior_wr': prior_wr,
+            'recent_sharpe': recent_sharpe,
+            'prior_sharpe': prior_sharpe,
+        }
+
+    def get_adaptive_threshold(self, base: float = 0.55) -> float:
+        """
+        Adaptive ML prediction threshold based on live performance vs recent baseline.
+          Severe degradation  → tighten by 0.10 (max 0.75)
+          Mild degradation    → tighten by 0.05 (max 0.70)
+          Outperforming       → relax by 0.025 (floor 0.50)
+          Normal              → return base unchanged
+        """
+        status = self.get_degradation_status()
+        severity = status.get('severity')
+        if severity == 'severe':
+            return min(base + 0.10, 0.75)
+        if severity == 'mild':
+            return min(base + 0.05, 0.70)
+
+        # Check if outperforming — give back some headroom
+        recent_wr = status.get('recent_wr', base)
+        prior_wr  = status.get('prior_wr', base)
+        if recent_wr > prior_wr + 0.05 and status['severity'] is None:
+            return max(base - 0.025, 0.50)
+
+        return base
 
     # ------------------------------------------------------------------
     # Sharpe / Sortino on trade P&L series

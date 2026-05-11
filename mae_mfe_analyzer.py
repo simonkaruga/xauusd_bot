@@ -18,9 +18,17 @@ Outputs:
 
 import numpy as np
 import pandas as pd
+from typing import NamedTuple
 from trade_database import TradeDatabase
 from config import Config
 from logger import logger
+
+
+class Excursion(NamedTuple):
+    mae: float
+    mfe: float
+    efficiency: float
+    is_win: bool
 
 
 class MAEMFEAnalyzer:
@@ -53,7 +61,7 @@ class MAEMFEAnalyzer:
             row = self._excursions_for_trade(t, df_bars)
             if row is None:
                 continue
-            mae, mfe, eff, is_win = row
+            mae, mfe, eff, is_win = row.mae, row.mfe, row.efficiency, row.is_win
             mae_list.append(mae)
             mfe_list.append(mfe)
             efficiency_list.append(eff)
@@ -91,7 +99,7 @@ class MAEMFEAnalyzer:
             captured = float((entry_price - exit_price) / entry_price * 100)
 
         eff = (captured / mfe * 100) if mfe > 0 else 0
-        return mae, mfe, eff, profit > 0
+        return Excursion(mae, mfe, eff, profit > 0)
 
     def _price_path(self, df_bars: pd.DataFrame,
                     ts_entry: pd.Timestamp, ts_close) -> pd.DataFrame:
